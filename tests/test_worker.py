@@ -197,7 +197,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         await self.worker().scan()
         self.assertEqual(self.calls, 0)
         self.assertFalse(self.store.all())
-        self.assertEqual(value(self.notion.p, "状态"), "待办")
+        self.assertEqual(value(self.notion.p, "状态"), "草稿")
 
     async def test_project_edit_during_read_skips_launch(self):
         self.project_instructions("instructions")
@@ -275,11 +275,41 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.notion.p["properties"]["执行机器"]["select"]["name"] = "other"
         await self.worker().scan()
         self.assertEqual(self.calls, 0)
+        self.assertEqual(value(self.notion.p, "状态"), "待办")
         self.notion.p["properties"]["执行机器"]["select"]["name"] = "test-machine"
         self.notion.p["properties"]["项目"]["select"]["name"] = "missing"
         await self.worker().scan()
         self.assertEqual(self.calls, 0)
-        self.assertEqual(value(self.notion.p, "状态"), "待办")
+        self.assertEqual(value(self.notion.p, "状态"), "草稿")
+
+    async def test_invalid_task_returns_to_draft_until_explicit_resubmission(self):
+        self.notion.p["properties"]["类型"]["select"]["name"] = ""
+        worker = self.worker()
+        await worker.scan()
+        self.assertEqual(value(self.notion.p, "状态"), "草稿")
+        self.assertIn("类型必须为代码或调研", value(self.notion.p, "运行摘要"))
+        self.assertEqual(self.calls, 0)
+        writes = len(self.notion.writes)
+        self.notion.p["properties"]["类型"]["select"]["name"] = "代码"
+        await worker.scan()
+        self.assertEqual(len(self.notion.writes), writes)
+        self.assertEqual(self.calls, 0)
+        self.notion.update("page-1", status="待办")
+        await worker.scan()
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(value(self.notion.p, "状态"), "待我验收")
+
+    async def test_reject_preserves_human_changes_since_scan(self):
+        self.notion.p["properties"]["类型"]["select"]["name"] = ""
+        original_query = self.notion.query
+        def edited_query(*args, **kwargs):
+            rows = original_query(*args, **kwargs)
+            self.notion.update("page-1", status="完成")
+            return rows
+        self.notion.query = edited_query
+        await self.worker().scan()
+        self.assertEqual(value(self.notion.p, "状态"), "完成")
+        self.assertEqual(self.calls, 0)
 
     async def test_empty_body_not_started_and_dry_run_is_read_only(self):
         self.notion.body_text = " "

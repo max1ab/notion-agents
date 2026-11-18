@@ -89,7 +89,7 @@ class Notion:
             expected["执行机器"] = "select"
         errors = [f"{key} 需要 {kind}" for key, kind in expected.items() if schema.get(key, {}).get("type") != kind]
         options = {x["name"] for x in schema.get("状态", {}).get("status", {}).get("options", [])}
-        errors += [f"缺少状态：{name}" for name in ("待办", "执行中", "待我验收", "完成", "需处理") if name not in options]
+        errors += [f"缺少状态：{name}" for name in ("草稿", "待办", "执行中", "待我验收", "完成", "需处理") if name not in options]
         if errors:
             raise ValueError("；".join(errors))
         return schema

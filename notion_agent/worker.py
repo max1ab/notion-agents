@@ -266,16 +266,33 @@ class Worker:
         self.store.put(run)
         log.info("评论交付 %s -> %s", run["id"], run["target_status"])
 
+    def reject(self, page, reason):
+        current = self.notion.page(page["id"])
+        if value(current, "状态") != "待办" or task_snapshot(current, "") != task_snapshot(page, ""):
+            return
+        project = current.get("properties", {}).get("项目", {})
+        if project.get("type") == "relation":
+            if not any(link["id"] in self.config.projects for link in project.get("relation", [])):
+                return
+        elif value(current, "执行机器") != self.config.machine_id:
+            return
+        self.notion.update(page["id"], status="草稿", summary="未接单：" + reason)
+
     async def accept(self, page):
         # Re-read full input immediately before local claim, no shell interpolation.
         self.refresh_projects()
         page = self.notion.page(page["id"])
         reason = self.candidate(page)
         if reason:
+            self.reject(page, reason)
             return
-        body = self.notion.body(page["id"])
+        try:
+            body = self.notion.body(page["id"])
+        except ValueError as error:
+            self.reject(page, str(error))
+            return
         if not body.strip():
-            self.notion.update(page["id"], summary="未接单：任务正文不能为空")
+            self.reject(page, "任务正文不能为空")
             return
         snapshot = task_snapshot(page, body)
         guide = ""
@@ -283,7 +300,7 @@ class Worker:
             try:
                 guide = self.notion.body(self.config.agent_guide_page_id)
             except ValueError as error:
-                self.notion.update(page["id"], summary="未接单：Agent 使用说明读取失败：" + str(error))
+                self.reject(page, "Agent 使用说明读取失败：" + str(error))
                 return
         project = copy.deepcopy(self.config.projects[snapshot["project"]])
         project_page_id = project.get("notion_page_id")
@@ -293,7 +310,7 @@ class Worker:
                 if len(instructions.encode("utf-8")) > 64000:
                     raise ValueError("项目指令正文超过 64000 字节，请缩短")
             except ValueError as error:
-                self.notion.update(page["id"], summary="未接单：项目指令读取失败：" + str(error))
+                self.reject(page, "项目指令读取失败：" + str(error))
                 return
             current_project = self.notion.page(project_page_id)
             if current_project.get("last_edited_time") != project.get("notion_last_edited_time"):
@@ -301,7 +318,7 @@ class Worker:
                 return
             project["instructions"] = instructions
         if len((guide + project.get("instructions", "")).encode("utf-8")) > 64000:
-            self.notion.update(page["id"], summary="未接单：使用说明与项目指令合计超过 64000 字节")
+            self.reject(page, "使用说明与项目指令合计超过 64000 字节")
             return
         check = self.notion.page(page["id"])
         if fingerprint(task_snapshot(check, body)) != fingerprint(snapshot) or check.get("last_edited_time") != page.get("last_edited_time"):
@@ -369,7 +386,7 @@ class Worker:
             if dry_run:
                 continue
             if reason:
-                self.notion.update(page["id"], summary="未接单：" + reason)
+                self.reject(page, reason)
                 continue
             await self.accept(page)
             # Single task per scan; poll picks up freshly edited priorities/configuration.
