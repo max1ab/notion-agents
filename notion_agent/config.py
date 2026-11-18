@@ -51,6 +51,7 @@ class Config:
     comments: bool = True
     env_file: Path | None = None
     projects_data_source_id: str | None = None
+    agent_guide_page_id: str | None = None
 
     def token(self):
         value = os.environ.get(self.token_env, "")
@@ -96,7 +97,8 @@ def load(path: Path) -> Config:
                   local(data["token_file"]) if data.get("token_file") else None,
                   agents, projects, data.get("comments", True),
                   env_file=local(data.get("env_file", ".env")),
-                  projects_data_source_id=data.get("projects_data_source_id") or None)
+                  projects_data_source_id=data.get("projects_data_source_id") or None,
+                  agent_guide_page_id=data.get("agent_guide_page_id") or None)
 
 
 def save(data: dict, path: Path):

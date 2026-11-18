@@ -37,6 +37,10 @@ def command(agent_name, settings, run_dir):
     args = list(settings.get("args", []))
     instructions_file = run_dir / "project-instructions.txt"
     instructions = instructions_file.read_text() if instructions_file.exists() else ""
+    guide_file = run_dir / "workspace-guide.txt"
+    guide = guide_file.read_text() if guide_file.exists() else ""
+    if guide.strip():
+        instructions = "工作空间使用说明：\n" + guide + "\n\n本项目指令：\n" + instructions
     if agent_name == "Codex":
         if instructions.strip():
             args.extend(["-c", "developer_instructions=" + json.dumps(instructions, ensure_ascii=False)])

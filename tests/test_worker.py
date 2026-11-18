@@ -9,10 +9,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from notion_agent.config import initial, load, save
-from notion_agent.notion import Notion, NotionError, rich, value
+from notion_agent.notion import Notion, NotionError, CommentWriteUncertain, rich, value
 from notion_agent.runners import command, execute, parse_events, child_environment
 from notion_agent.store import Store, instance_lock
-from notion_agent.worker import Worker, outcome
+from notion_agent.worker import Worker, outcome, readable_answer
 from notion_agent.workspace import prepare
 
 
@@ -31,11 +31,16 @@ class FakeNotion:
         self.p = p
         self.blocks = {}
         self.comments = {}
+        self.comment_names = {}
         self.fail_delivery_once = False
         self.body_text = "请输出测试报告，验收：给出结论。"
         self.writes = []
 
-    def query(self, machine):
+    def query(self, machine, project_ids=None):
+        if project_ids is not None:
+            ids = [x["id"] for x in self.p.get("properties", {}).get("项目", {}).get("relation", [])]
+            if not set(ids).intersection(project_ids):
+                return []
         return [copy.deepcopy(self.p)] if value(self.p, "状态") == "待办" else []
 
     def page(self, _):
@@ -60,6 +65,23 @@ class FakeNotion:
 
     def comment(self, page_id, marker, text):
         self.comments.setdefault(marker, text)
+
+    def post_comment(self, page_id, message, operation, persist, discussion_id=None, display_name=None):
+        if operation.get("comment_id"):
+            return operation["comment_id"], operation["remote_discussion_id"]
+        if "fake_key" not in operation:
+            operation["fake_key"] = "comment-" + str(len(self.comments))
+            persist()
+        key = operation["fake_key"]
+        self.comments.setdefault(key, message)
+        self.comment_names[key] = display_name
+        if self.fail_delivery_once and discussion_id:
+            self.fail_delivery_once = False
+            raise NotionError("comment response lost")
+        thread = discussion_id or "thread-" + key
+        operation.update(comment_id=key, remote_discussion_id=thread)
+        persist()
+        return key, thread
 
 
 class WorkerTests(unittest.IsolatedAsyncioTestCase):
@@ -88,6 +110,64 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
 
     def worker(self):
         return Worker(self.config, self.notion, self.store, self.fake_runner)
+
+    def relation_project(self):
+        self.notion.project_property_type = "relation"
+        self.notion.project_relation_target = "remote-projects"
+        self.config.projects_data_source_id = "remote-projects"
+        self.notion.p["properties"]["项目"] = {"type": "relation", "relation": [{"id": "project-1"}]}
+        self.notion.p["properties"].pop("执行机器", None)
+        remote = {"project-1": {"name": "demo", "path": str(self.root), "machine_id": "test-machine",
+                                "notion_page_id": "project-1", "notion_last_edited_time": "v1"}}
+        self.notion.projects = lambda source, machine, by_id=False: copy.deepcopy(remote)
+        original_page = self.notion.page
+        original_body = self.notion.body
+        def project_page(id):
+            if id != "project-1":
+                return original_page(id)
+            return {"last_edited_time": "v1", "properties": {
+                "项目": {"type": "title", "title": rich(remote[id]["name"])},
+                "执行机器": {"type": "rich_text", "rich_text": rich(remote[id]["machine_id"])},
+                "本机目录": {"type": "rich_text", "rich_text": rich(remote[id]["path"])}}}
+        self.notion.page = project_page
+        self.notion.body = lambda id: "项目指令" if id == "project-1" else original_body(id)
+        return remote
+
+    async def test_relation_routes_from_project_without_task_machine(self):
+        self.relation_project()
+        await self.worker().scan()
+        self.assertEqual(self.calls, 1)
+        run = self.store.all()[0]
+        self.assertEqual(run["snapshot"]["project"], "project-1")
+        self.assertEqual(run["project_settings"]["name"], "demo")
+        self.assertEqual(run["machine"], "test-machine")
+        self.assertEqual(value(self.notion.p, "状态"), "待我验收")
+
+    async def test_relation_project_rename_keeps_routing_identity(self):
+        remote = self.relation_project()
+        async def rename(config, run, store):
+            await self.fake_runner(config, run, store)
+            remote["project-1"]["name"] = "renamed"
+        await Worker(self.config, self.notion, self.store, rename).scan()
+        self.assertEqual(self.store.all()[0]["phase"], "complete")
+
+    async def test_relation_project_move_after_execution_holds_delivery(self):
+        remote = self.relation_project()
+        async def move(config, run, store):
+            await self.fake_runner(config, run, store)
+            remote["project-1"]["machine_id"] = "other-machine"
+        await Worker(self.config, self.notion, self.store, move).scan()
+        self.assertEqual(self.store.all()[0]["phase"], "hold")
+        self.assertEqual(value(self.notion.p, "状态"), "执行中")
+
+    async def test_relation_requires_exactly_one_project(self):
+        self.relation_project()
+        worker = self.worker()
+        worker.refresh_projects()
+        self.notion.p["properties"]["项目"]["relation"] = []
+        self.assertIn("只选择一个", worker.candidate(self.notion.p))
+        self.notion.p["properties"]["项目"]["relation"] = [{"id": "project-1"}, {"id": "project-2"}]
+        self.assertIn("只选择一个", worker.candidate(self.notion.p))
 
     def project_instructions(self, text):
         self.config.projects["demo"].update(notion_page_id="project-page", notion_last_edited_time="v1")
@@ -139,9 +219,35 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         await worker.scan()
         self.assertEqual(self.calls, 1)
         self.assertEqual(value(self.notion.p, "状态"), "待我验收")
-        self.assertEqual(len(self.notion.blocks), 1)
+        self.assertEqual(len(self.notion.blocks), 0)
+        self.assertEqual(len(self.notion.comments), 2)
         self.assertEqual(self.store.all()[0]["phase"], "complete")
         self.assertEqual(self.notion.body_text, "请输出测试报告，验收：给出结论。")
+
+    async def test_conversation_has_only_readable_content_and_summary(self):
+        await self.worker().scan()
+        messages = list(self.notion.comments.values())
+        self.assertEqual(messages, ["Codex 开始处理这个任务。", "结论：通过。"])
+        self.assertEqual(list(self.notion.comment_names.values()), ["调度程序", "Codex"])
+        summary = value(self.notion.p, "运行摘要")
+        self.assertEqual(summary, "已完成，等你验收。")
+        self.assertNotIn(self.store.all()[0]["id"], "\n".join(messages) + summary)
+        self.assertFalse(self.notion.blocks)
+
+    async def test_claude_answer_is_signed_as_claude(self):
+        self.config.agents["Claude Code"]["command"] = "/usr/bin/true"
+        self.notion.p["properties"]["执行 Agent"]["select"]["name"] = "Claude Code"
+        await self.worker().scan()
+        self.assertEqual(list(self.notion.comment_names.values()), ["调度程序", "Claude Code"])
+
+    async def test_workspace_guide_is_saved_and_not_inserted_into_task(self):
+        self.config.agent_guide_page_id = "guide"
+        original = self.notion.body
+        self.notion.body = lambda id: "使用工作区的说明" if id == "guide" else original(id)
+        await self.worker().scan()
+        run = self.store.all()[0]
+        self.assertEqual(run["workspace_guide"]["content"], "使用工作区的说明")
+        self.assertEqual((Path(run["run_dir"]) / "workspace-guide.txt").read_text(), "使用工作区的说明")
 
     async def test_lost_delivery_response_reconciles_without_rerunning(self):
         self.notion.fail_delivery_once = True
@@ -152,7 +258,8 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(value(self.notion.p, "状态"), "执行中")
         await worker.scan()
         self.assertEqual(self.calls, 1)
-        self.assertEqual(len(self.notion.blocks), 1)
+        self.assertEqual(len(self.notion.blocks), 0)
+        self.assertEqual(len(self.notion.comments), 2)
         self.assertEqual(value(self.notion.p, "状态"), "待我验收")
 
     async def test_reset_after_delivery_creates_new_run(self):
@@ -296,7 +403,8 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             await worker.scan()
         await worker.scan()
         self.assertEqual(self.calls, 1)
-        self.assertEqual(len(self.notion.blocks), 1)
+        self.assertEqual(len(self.notion.blocks), 0)
+        self.assertEqual(len(self.notion.comments), 2)
         self.assertEqual(self.store.all()[0]["phase"], "complete")
 
     async def test_remote_projects_refresh_and_dry_run_does_not_sync(self):
@@ -325,6 +433,93 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class UnitTests(unittest.TestCase):
+    def test_relation_query_filters_by_local_projects_and_deduplicates(self):
+        notion = Notion("fake", "tasks")
+        calls = []
+        def request(method, path, body=None):
+            calls.append(copy.deepcopy(body))
+            return {"results": [page()], "has_more": False}
+        notion.request = request
+        rows = notion.query("machine", project_ids=[str(i) for i in range(100)])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["filter"]["and"][1]["or"][0], {"property": "项目", "relation": {"contains": "0"}})
+        self.assertNotIn("执行机器", json.dumps(calls, ensure_ascii=False))
+        self.assertEqual(notion.query("machine", project_ids=[]), [])
+
+    def test_protocol_metadata_removed_without_removing_content(self):
+        self.assertEqual(readable_answer('完成。\n```json\n{"task_outcome":"ready_for_review","tests":"ok"}\n```'), "完成。")
+        self.assertEqual(readable_answer('说明：\n{"user_data": 1}'), '说明：\n{"user_data": 1}')
+
+    def test_comment_receipt_recovers_lost_response_without_visible_marker(self):
+        notion = Notion("fake", "source")
+        remote = []
+        writes = []
+        def request(method, path, body=None):
+            if method == "GET" and path == "users/me":
+                return {"id": "author"}
+            if method == "GET":
+                return {"results": remote, "has_more": False}
+            writes.append(body)
+            remote.append({"id": "comment", "discussion_id": "thread", "created_by": {"id": "author"}, "rich_text": body["rich_text"]})
+            raise NotionError("response lost")
+        notion.request = request
+        operation = {}
+        with self.assertRaises(NotionError):
+            notion.post_comment("page", "已完成，请验收。", operation, lambda: None)
+        self.assertEqual(notion.post_comment("page", "已完成，请验收。", operation, lambda: None), ("comment", "thread"))
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0]["rich_text"], rich("已完成，请验收。"))
+
+    def test_uncertain_comment_missing_from_list_is_not_duplicated(self):
+        notion = Notion("fake", "source")
+        calls = []
+        notion.request = lambda method, path, body=None: calls.append(method) or {"results": [], "has_more": False}
+        operation = {"baseline_ids": [], "message": "done", "discussion_id": None, "actor_id": "author", "attempted": True}
+        with self.assertRaises(CommentWriteUncertain):
+            notion.post_comment("page", "done", operation, lambda: None)
+        self.assertNotIn("POST", calls)
+
+    def test_comment_reconciliation_distinguishes_display_names(self):
+        notion = Notion("fake", "source")
+        comments = [{"id": name, "discussion_id": "thread", "created_by": {"id": "author"},
+                     "rich_text": rich("done"), "display_name": {"type": "custom", "resolved_name": name}}
+                    for name in ("调度程序", "Codex")]
+        notion.request = lambda method, path, body=None: {"results": comments, "has_more": False}
+        operation = {"baseline_ids": [], "message": "done", "discussion_id": None,
+                     "actor_id": "author", "attempted": True, "display_name": "Codex"}
+        self.assertEqual(notion.post_comment("page", "done", operation, lambda: None, display_name="Codex"), ("Codex", "thread"))
+
+    def test_custom_display_name_is_in_comment_request(self):
+        notion = Notion("fake", "source")
+        sent = []
+        def request(method, path, body=None):
+            if path == "users/me":
+                return {"id": "author"}
+            if method == "GET":
+                return {"results": [], "has_more": False}
+            sent.append(body)
+            return {"id": "comment", "discussion_id": "thread"}
+        notion.request = request
+        notion.post_comment("page", "自然语言回复", {}, lambda: None, display_name="Claude Code")
+        self.assertEqual(sent[0]["display_name"], {"type": "custom", "custom": {"name": "Claude Code"}})
+        self.assertEqual(sent[0]["rich_text"], rich("自然语言回复"))
+
+    def test_old_identical_comment_is_not_mistaken_for_new_delivery(self):
+        notion = Notion("fake", "source")
+        old = {"id": "old", "discussion_id": "old-thread", "created_by": {"id": "author"}, "rich_text": rich("done")}
+        posted = []
+        def request(method, path, body=None):
+            if path == "users/me":
+                return {"id": "author"}
+            if method == "GET":
+                return {"results": [old], "has_more": False}
+            posted.append(body)
+            return {"id": "new", "discussion_id": "new-thread"}
+        notion.request = request
+        self.assertEqual(notion.post_comment("page", "done", {}, lambda: None), ("new", "new-thread"))
+        self.assertEqual(len(posted), 1)
+
     def test_project_instructions_use_executor_instruction_channels(self):
         with tempfile.TemporaryDirectory() as td:
             directory = Path(td)

@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import workspace
 from .config import load
-from .notion import value
+from .notion import value, project_key
 from .runners import execute, process_alive, parse_events
 
 log = logging.getLogger(__name__)
@@ -24,8 +24,9 @@ def now():
 
 def task_snapshot(page, body):
     return {"title": value(page, "任务"), "body": body,
-            "machine": value(page, "执行机器"), "agent": value(page, "执行 Agent"),
-            "project": value(page, "项目"), "kind": value(page, "类型"),
+            "machine": "" if page.get("properties", {}).get("项目", {}).get("type") == "relation" else value(page, "执行机器"),
+            "agent": value(page, "执行 Agent"), "project": project_key(page),
+            "project_type": page.get("properties", {}).get("项目", {}).get("type"), "kind": value(page, "类型"),
             "edited": page.get("last_edited_time"), "previous_run_id": value(page, "最近运行 ID")}
 
 
@@ -46,7 +47,7 @@ Notion issue：https://www.notion.so/{run['page_id'].replace('-', '')}
 直接在上面的项目目录执行，保留已有改动，不创建 worktree 或切换分支。
 未经本次任务明确授权，不提交、推送或合并代码，不给其他人发消息。
 不更改本 issue 的状态或结果，服务负责回写。正文后续变更不属于本次快照。
-最终回答请给出完整交付正文（含调研引用或代码改动）、实际运行的测试及结果、未完成项。
+最终回答像直接向用户汇报：给出完整交付正文（含引用或改动）、实际测试结果和未完成项，不列运行 ID、会话 ID、快照哈希或内部日志。
 遇到缺信息、权限、测试失败或未完成验收条件，明确说明，不能声称成功。
 最后单独输出一行机器可读 JSON：
 {{"task_outcome":"ready_for_review","tests":"实际测试事实","limitations":"剩余限制"}}
@@ -71,6 +72,22 @@ def outcome(answer):
     return {"task_outcome": "needs_attention", "tests": "未收到结构化验收声明", "limitations": "请人工核对输出"}
 
 
+def readable_answer(answer):
+    lines = answer.strip().splitlines()
+    hidden = set()
+    for index, line in enumerate(lines):
+        try:
+            metadata = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(metadata, dict) and metadata.get("task_outcome") in ("ready_for_review", "needs_attention"):
+            hidden.add(index)
+            if index > 0 and lines[index - 1].strip() in ("```", "```json"):
+                if index + 1 < len(lines) and lines[index + 1].strip() == "```":
+                    hidden.update((index - 1, index + 1))
+    return "\n".join(line for index, line in enumerate(lines) if index not in hidden).strip()
+
+
 class Worker:
     def __init__(self, config, notion, store, runner=execute):
         self.config = config
@@ -80,7 +97,8 @@ class Worker:
 
     def candidate(self, page):
         c = self.config
-        if value(page, "状态") != "待办" or value(page, "执行机器") != c.machine_id:
+        relation = page.get("properties", {}).get("项目", {}).get("type") == "relation"
+        if value(page, "状态") != "待办" or (not relation and value(page, "执行机器") != c.machine_id):
             return "不属于本机待办"
         agent = value(page, "执行 Agent")
         if agent not in c.agents or not c.agents[agent].get("enabled", True):
@@ -89,9 +107,13 @@ class Worker:
             return "Agent CLI 不存在或不可执行"
         if not value(page, "任务").strip():
             return "任务标题不能为空"
-        project = c.projects.get(value(page, "项目"))
+        if not project_key(page):
+            return "请选择且只选择一个项目"
+        project = c.projects.get(project_key(page))
         if not project:
             return "项目尚未注册到本机"
+        if project.get("machine_id", c.machine_id) != c.machine_id:
+            return "项目不属于本机"
         kind = value(page, "类型")
         if kind not in ("代码", "调研"):
             return "类型必须为代码或调研"
@@ -107,12 +129,31 @@ class Worker:
         return ""
 
     def refresh_projects(self, sync=False):
+        relation = getattr(self.notion, "project_property_type", None) == "relation"
+        target = getattr(self.notion, "project_relation_target", None)
+        if relation:
+            source = self.config.projects_data_source_id or target
+            if not source or (target and target != source):
+                raise ValueError("任务项目关联目标与项目配置数据源不一致")
+            self.config.projects = self.notion.projects(source, self.config.machine_id, by_id=True)
+            return
         if self.config.projects_data_source_id:
             self.config.projects = self.notion.projects(self.config.projects_data_source_id, self.config.machine_id)
             if sync:
                 self.notion.register(self.config.machine_id, list(self.config.projects))
 
     def route_matches(self, page, run):
+        if run["snapshot"].get("project_type") == "relation":
+            if project_key(page) != run["snapshot"]["project"] or value(page, "执行 Agent") != run["agent"]:
+                return False
+            project = self.notion.page(run["snapshot"]["project"])
+            if project.get("archived") or project.get("in_trash"):
+                return False
+            directory = value(project, "本机目录")
+            if not directory or not Path(directory).expanduser().is_absolute():
+                return False
+            return (value(project, "执行机器") == run["machine"]
+                    and Path(directory).expanduser().resolve() == Path(run["project_settings"]["path"]).resolve())
         return (value(page, "执行机器") == run["machine"] and value(page, "执行 Agent") == run["agent"]
                 and value(page, "项目") == run["snapshot"]["project"])
 
@@ -132,6 +173,11 @@ class Worker:
                   f"测试：{verdict.get('tests', '未报告')}\n限制：{verdict.get('limitations', '')}\n\n"
                   + (run.get("answer") or "没有最终回答，请查看本机日志。"))
         run["chunks"] = [report[i:i + 54000] for i in range(0, len(report), 54000)]
+        if run.get("delivery_format") == "conversation":
+            answer = readable_answer(run.get("answer", "")) or "这次没能完成任务，需要你确认后再继续。"
+            if run.get("error") and run.get("answer"):
+                answer = "这次执行中断了，以下是已保存的回复，尚需核对：\n\n" + answer
+            run["reply_chunks"] = [answer[i:i + 18000] for i in range(0, len(answer), 18000)]
         run.update(phase="delivering", sent_chunks=run.get("sent_chunks", {}))
         self.store.put(run)
 
@@ -164,6 +210,9 @@ class Worker:
             run.update(phase="hold", error="Notion 状态被人工修改，保留本地交付，等待人工对账")
             self.store.put(run)
             return
+        if run.get("delivery_format") == "conversation":
+            self.deliver_conversation(run)
+            return
         for index, chunk in enumerate(run["chunks"]):
             key = str(index)
             if key not in run["sent_chunks"]:
@@ -183,11 +232,39 @@ class Worker:
             run.update(phase="hold", error="交付期间路由或状态变化，请人工对账")
             self.store.put(run)
             return
-        summary = f"{run['target_status']} · {run['id']} · 会话 {run.get('session_id') or '未知'}"
+        summary = "已完成，等你验收。" if run["target_status"] == "待我验收" else "任务需要你处理，请查看回复。"
         self.notion.update(run["page_id"], status=run["target_status"], summary=summary)
         run["phase"] = "complete"
         self.store.put(run)
         log.info("交付 %s -> %s", run["id"], run["target_status"])
+
+    def conversation_message(self, run, key, message, discussion_id=None):
+        operation = run.setdefault("comment_operations", {}).setdefault(key, {})
+        return self.notion.post_comment(run["page_id"], message, operation,
+                                       lambda: self.store.put(run), discussion_id,
+                                       display_name="调度程序" if key == "claim" else run["agent"])
+
+    def deliver_conversation(self, run):
+        discussion_id = run.get("discussion_id")
+        if not discussion_id and "claim" in run.get("comment_operations", {}):
+            _, discussion_id = self.conversation_message(run, "claim", f"{run['agent']} 开始处理这个任务。")
+            run["discussion_id"] = discussion_id
+            self.store.put(run)
+        for index, chunk in enumerate(run["reply_chunks"]):
+            _, discussion_id = self.conversation_message(run, f"reply-{index}", chunk, discussion_id)
+            run["discussion_id"] = discussion_id
+            self.store.put(run)
+        page = self.notion.page(run["page_id"])
+        if (value(page, "最近运行 ID") != run["id"] or not self.route_matches(page, run)
+                or value(page, "状态") not in ("执行中", run["target_status"])):
+            run.update(phase="hold", error="交付期间路由或状态变化，请人工对账")
+            self.store.put(run)
+            return
+        summary = "已完成，等你验收。" if run["target_status"] == "待我验收" else "任务需要你处理，请查看回复。"
+        self.notion.update(run["page_id"], status=run["target_status"], summary=summary)
+        run["phase"] = "complete"
+        self.store.put(run)
+        log.info("评论交付 %s -> %s", run["id"], run["target_status"])
 
     async def accept(self, page):
         # Re-read full input immediately before local claim, no shell interpolation.
@@ -201,6 +278,13 @@ class Worker:
             self.notion.update(page["id"], summary="未接单：任务正文不能为空")
             return
         snapshot = task_snapshot(page, body)
+        guide = ""
+        if self.config.agent_guide_page_id:
+            try:
+                guide = self.notion.body(self.config.agent_guide_page_id)
+            except ValueError as error:
+                self.notion.update(page["id"], summary="未接单：Agent 使用说明读取失败：" + str(error))
+                return
         project = copy.deepcopy(self.config.projects[snapshot["project"]])
         project_page_id = project.get("notion_page_id")
         if project_page_id:
@@ -216,6 +300,9 @@ class Worker:
                 log.info("项目配置正在编辑，本轮跳过 %s", snapshot["project"])
                 return
             project["instructions"] = instructions
+        if len((guide + project.get("instructions", "")).encode("utf-8")) > 64000:
+            self.notion.update(page["id"], summary="未接单：使用说明与项目指令合计超过 64000 字节")
+            return
         check = self.notion.page(page["id"])
         if fingerprint(task_snapshot(check, body)) != fingerprint(snapshot) or check.get("last_edited_time") != page.get("last_edited_time"):
             log.info("任务正在编辑，本轮跳过 %s", page["id"])
@@ -227,12 +314,13 @@ class Worker:
                "snapshot_hash": fingerprint(snapshot), "machine": self.config.machine_id,
                "agent": snapshot["agent"], "agent_settings": self.config.agents[snapshot["agent"]],
                "project_settings": project,
-               "run_dir": str(run_dir), "started_at": now()}
+               "run_dir": str(run_dir), "started_at": now(), "delivery_format": "conversation",
+               "workspace_guide": {"page_id": self.config.agent_guide_page_id, "content": guide}}
         self.store.put(run)
         (run_dir / "snapshot.json").write_text(json.dumps(run, ensure_ascii=False, indent=2))
         # Ambiguous claim response leaves a durable claimed record; recovery will reconcile, not launch.
         self.notion.update(page["id"], status="执行中", run_id=run_id,
-                           summary=f"已接单 {run_id}；采用 {run['started_at']} 的正文快照")
+                           summary=f"{run['agent']} 正在处理这个任务。")
         check = self.notion.page(page["id"])
         if value(check, "最近运行 ID") != run_id or value(check, "状态") != "执行中" or not self.route_matches(check, run):
             self.seal(run, "启动前路由或状态变化，未启动 Agent")
@@ -240,9 +328,11 @@ class Worker:
             return
         try:
             if self.config.comments:
-                self.notion.comment(page["id"], f"[notion-agent:{run_id}:claim]", f"{run['machine']} 已接单，执行 Agent：{run['agent']}。")
+                _, run["discussion_id"] = self.conversation_message(run, "claim", f"{run['agent']} 开始处理这个任务。")
+                self.store.put(run)
             run.update(workspace.prepare(run["project_settings"], snapshot["kind"], run_dir, run_id))
             (run_dir / "project-instructions.txt").write_text(project.get("instructions", ""))
+            (run_dir / "workspace-guide.txt").write_text(guide)
             (run_dir / "prompt.txt").write_text(prompt_for(run))
             self.store.put(run)
             await self.runner(self.config, run, self.store)
@@ -262,7 +352,10 @@ class Worker:
                 log.warning("未完成运行尚未对账，本轮不接新任务")
                 return []
         self.refresh_projects(sync=not dry_run)
-        rows = self.notion.query(self.config.machine_id)
+        if getattr(self.notion, "project_property_type", None) == "relation":
+            rows = self.notion.query(self.config.machine_id, project_ids=list(self.config.projects))
+        else:
+            rows = self.notion.query(self.config.machine_id)
         result = []
         for page in rows:
             reason = self.candidate(page)
@@ -293,7 +386,7 @@ class Worker:
                     raise ValueError("修改机器名、state_dir 或任务库后请重启服务")
                 self.config = refreshed
                 await self.scan()
-                log.info("扫描完成：本机项目 %s", ", ".join(self.config.projects) or "无")
+                log.info("扫描完成：本机项目 %s", ", ".join(p.get("name", k) for k, p in self.config.projects.items()) or "无")
                 delay = self.config.poll_seconds
             except Exception as error:
                 log.error("扫描失败：%s: %s", type(error).__name__, error)

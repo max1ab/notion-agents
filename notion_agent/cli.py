@@ -139,8 +139,9 @@ def run(args):
             notion = Notion(config.token(), config.data_source_id)
             notion.check_schema()
             if config.projects_data_source_id:
-                config.projects = notion.projects(config.projects_data_source_id, config.machine_id)
-                print("Notion 项目配置：" + (", ".join(config.projects) or "本机尚无项目"))
+                config.projects = notion.projects(config.projects_data_source_id, config.machine_id,
+                                                 by_id=notion.project_property_type == "relation")
+                print("Notion 项目配置：" + (", ".join(p.get("name", k) for k, p in config.projects.items()) or "本机尚无项目"))
             print("Notion 凭证与看板 schema：通过")
         except (ValueError, OSError, RuntimeError) as error:
             print(f"Notion：{error}")
@@ -152,6 +153,9 @@ def run(args):
     notion = Notion(config.token(), config.data_source_id)
     if args.action == "register":
         notion.check_schema()
+        if notion.project_property_type == "relation":
+            print("项目使用 Notion 原生关联，无需同步下拉选项；机器和目录从项目记录读取。")
+            return
         if config.projects_data_source_id:
             config.projects = notion.projects(config.projects_data_source_id, config.machine_id)
         notion.register(config.machine_id, list(config.projects))
