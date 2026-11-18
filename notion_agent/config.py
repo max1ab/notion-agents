@@ -50,6 +50,7 @@ class Config:
     projects: dict
     comments: bool = True
     env_file: Path | None = None
+    projects_data_source_id: str | None = None
 
     def token(self):
         value = os.environ.get(self.token_env, "")
@@ -94,7 +95,8 @@ def load(path: Path) -> Config:
                   poll, timeout, data.get("token_env", "NOTION_TOKEN"),
                   local(data["token_file"]) if data.get("token_file") else None,
                   agents, projects, data.get("comments", True),
-                  env_file=local(data.get("env_file", ".env")))
+                  env_file=local(data.get("env_file", ".env")),
+                  projects_data_source_id=data.get("projects_data_source_id") or None)
 
 
 def save(data: dict, path: Path):
@@ -120,6 +122,7 @@ def save(data: dict, path: Path):
 def initial():
     return {"machine_id": socket.gethostname(),
             "data_source_id": "00000000-0000-0000-0000-000000000000",
+            "projects_data_source_id": "",
             "state_dir": ".state", "poll_seconds": 30, "timeout_seconds": 3600,
             "token_env": "NOTION_TOKEN", "env_file": ".env", "comments": True,
             "agents": {"Codex": {"command": shutil.which("codex") or "/usr/local/bin/codex",

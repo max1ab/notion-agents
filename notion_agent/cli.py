@@ -30,7 +30,6 @@ def parser():
     project = sub.add_parser("project", help="新增/修改项目，下一轮自动生效")
     project.add_argument("key")
     project.add_argument("path", type=Path)
-    project.add_argument("--base", help="代码基线，如 main 或 origin/main；不自动 fetch")
     logs = sub.add_parser("logs")
     logs.add_argument("run_id")
     resolve = sub.add_parser("resolve", help="人工确认旧运行结束后解除本地阻塞，不重新执行")
@@ -90,12 +89,12 @@ def run(args):
                 raise ValueError("机器名不能为空")
             data["machine_id"] = args.name
         else:
+            if data.get("projects_data_source_id"):
+                raise ValueError("已启用 Notion 项目表，请直接在 Notion 添加项目、执行机器和本机目录")
             project_path = args.path.expanduser().resolve()
             if not project_path.is_dir():
                 raise ValueError("项目目录不存在")
             project = {"path": str(project_path)}
-            if args.base:
-                project["base"] = args.base
             data.setdefault("projects", {})[args.key] = project
         save(data, path)
         print("配置已更新；项目下轮生效，机器名修改后需重启。使用 register 同步下拉选项。")
@@ -129,7 +128,9 @@ def run(args):
         return
     if args.action == "doctor":
         failed = False
-        print(f"机器：{config.machine_id}\n状态目录：{config.state_dir}\n项目：{', '.join(config.projects) or '尚无'}")
+        print(f"机器：{config.machine_id}\n状态目录：{config.state_dir}")
+        if not config.projects_data_source_id:
+            print("本地项目：" + (", ".join(config.projects) or "尚无"))
         for name, settings in config.agents.items():
             available = os.access(settings["command"], os.X_OK)
             print(f"{name}：{'CLI 可用' if available else 'CLI 不存在'} ({settings['command']})")
@@ -137,6 +138,9 @@ def run(args):
         try:
             notion = Notion(config.token(), config.data_source_id)
             notion.check_schema()
+            if config.projects_data_source_id:
+                config.projects = notion.projects(config.projects_data_source_id, config.machine_id)
+                print("Notion 项目配置：" + (", ".join(config.projects) or "本机尚无项目"))
             print("Notion 凭证与看板 schema：通过")
         except (ValueError, OSError, RuntimeError) as error:
             print(f"Notion：{error}")
@@ -148,6 +152,8 @@ def run(args):
     notion = Notion(config.token(), config.data_source_id)
     if args.action == "register":
         notion.check_schema()
+        if config.projects_data_source_id:
+            config.projects = notion.projects(config.projects_data_source_id, config.machine_id)
         notion.register(config.machine_id, list(config.projects))
         print("机器名与项目下拉选项已同步；旧选项已保留。")
         return

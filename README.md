@@ -2,7 +2,7 @@
 
 从 Notion 任务看板领取指定给本机的待办，启动本机 Codex 或 Claude Code，将完整结果写回卡片，再进入「待我验收」或「需处理」。用户决定何时移到「完成」。
 
-Python 3.11+，Mac / Linux，使用标准库直接访问官方 Notion API，无运行时第三方依赖。每机并发 1，默认 30 秒轮询。代码任务创建独立 Git 分支和 worktree，调研任务创建独立目录。CLI 和用户登录沿用本机环境，不自动绕过权限。
+Python 3.11+，Mac / Linux，使用标准库直接访问官方 Notion API，无运行时第三方依赖。每机并发 1，默认 30 秒轮询。代码和调研任务均直接在项目目录执行，不创建 worktree 或切换分支。CLI 和用户登录沿用本机环境，不自动绕过权限。
 
 ## 快速开始
 
@@ -12,10 +12,22 @@ Python 3.11+，Mac / Linux，使用标准库直接访问官方 Notion API，无�
 python3 -m notion_agent init
 python3 -m notion_agent machine macbook
 python3 -m notion_agent project research /absolute/path/to/materials
-python3 -m notion_agent project app /absolute/path/to/repo --base main
+python3 -m notion_agent project app /absolute/path/to/repo
 ```
 
-当前工作目录已生成 `config.toml`，无需重复 init。机器名默认为主机名；项目键对应卡片「项目」下拉选项。`project` 可新增或修改映射，下轮扫描生效；修改机器名、状态目录或数据源后重启服务。已有运行固定使用接单时的配置。卡片和本机映射都不能任意指定 shell 命令。
+当前工作目录已生成 `config.toml`，无需重复 init。机器名默认为主机名。修改机器名、状态目录或任务数据源后重启服务。
+
+### 在 Notion 添加项目
+
+当前已启用 [Agent 项目配置](https://www.notion.so/YOUR_PAGE_ID)。每行填写：
+
+| 项目 | 执行机器 | 本机目录 |
+| --- | --- | --- |
+| myapp | 与本机 machine_id 一致 | 本机已存在的绝对目录 |
+
+服务每轮读取此表，自动把项目名同步到任务卡的「项目」下拉框；保存后不用改 TOML、运行 register 或重启。一个项目在同一机器上只保留一行；不同机器可为同名项目填写不同目录。缺目录、相对路径或重复配置会阻止该项目接单。删除项目配置后不再接该项目的新任务，旧下拉选项保留。执行中的任务固定使用接单时的配置快照。
+
+`config.toml` 的 `projects_data_source_id` 指定项目表。启用后，本机 `[projects]` 不再参与派单；项目表访问失败时暂停接单，不使用旧目录。未配置项目表时仍支持 `[projects]` 和上面的 `project` 命令。
 
 ### 给独立服务授权 Notion
 
@@ -41,7 +53,9 @@ python3 -m notion_agent once
 python3 -m notion_agent run
 ```
 
-`register` 把机器名和已配置项目添加到看板下拉选项，保留旧选项。配置新增项目后再运行一次 register。`dry-run` 只读远端并显示候选和拒绝原因，不领取、写状态或启动 Agent；本地会初始化 SQLite。`once` 先恢复待回写任务，再扫描并最多执行一项，执行结束才退出。`run` 常驻。
+`register` 手动同步机器名和项目下拉选项，保留旧选项；Notion 项目模式下服务会自动同步。`dry-run` 只读远端并显示候选和拒绝原因，不领取、写状态或启动 Agent；本地会初始化 SQLite。`once` 先恢复待回写任务，再扫描并最多执行一项，执行结束才退出。`run` 常驻。
+
+项目记录正文作为该项目的长期指令：Codex 通过 `developer_instructions` 注入，Claude Code 通过 `--append-system-prompt` 追加。任务正文单独作为本次任务输入。每次接单保存项目正文到运行快照和 `project-instructions.txt`；正文读取失败或读取时发生修改，不启动任务。空白正文不追加指令；单次指令上限 64000 UTF-8 字节。`default` 是普通兜底项目，不是其他项目的全局默认配置；当前仍需在卡片明确选择项目。
 
 ## 怎么派单
 
@@ -49,7 +63,7 @@ python3 -m notion_agent run
 
 正文支持普通文本、列表、嵌套、代码块、表格、引用和明确链接；不自动递归读取外链。附件、图片、子页面、同步块、嵌入数据库等暂不支持的块会阻止接单，并在运行摘要说明。结果保存在本页以 `Agent result · 运行ID · 分片` 命名的折叠块里，正文和人工评论保留；很长的报告分块写入同一 issue，可直接展开阅读，首版未做报告子页面。
 
-代码项目必须配置基线，工作区必须干净。基线取本机引用的当前提交，不自动 fetch。新分支为 `notion/<run-id>`，不提交、推送或合并。调研工作区附带项目参考路径，原项目内容不会复制到新目录。项目指令、MCP、技能和记忆在新目录里的发现效果需分别实测，不能由本机 CLI 已安装推断。
+代码和调研任务都直接使用配置的项目目录，保留已有文件和未提交改动。不要求 Git 仓库、干净工作区或基线分支，不自动创建目录、切换分支、提交、推送或合并。每机一次执行一个任务。项目指令、MCP、技能和记忆的加载效果需分别实测，不能由 CLI 已安装推断。
 
 最终回答须包含完整结果和最后一行验收 JSON（提示词由服务生成）。进程退出码 0、CLI 协议成功、明确声明满足验收条件，才进入「待我验收」；否则「需处理」。Claude 的 permission_denials 也会阻止交付成功。AI 的声明是交付依据，成果质量和验收仍由用户判断。
 
@@ -60,7 +74,7 @@ python3 -m notion_agent status
 python3 -m notion_agent logs RUN_ID
 ```
 
-`.state/runs/<run-id>/` 下保留需求快照、实际提示词、结构化事件、stderr、工作目录和最终回答。会话 ID 来自 CLI 真实输出。恢复会话可使用 `codex exec resume SESSION_ID` 或 `claude --resume SESSION_ID`；先停止服务并核对卡片，手动恢复不会自动接回原 worker。
+`.state/runs/<run-id>/` 下保留需求快照、实际提示词、结构化事件、stderr 和最终回答；实际代码及产出保存在项目目录。会话 ID 来自 CLI 真实输出。恢复会话可使用 `codex exec resume SESSION_ID` 或 `claude --resume SESSION_ID`；先停止服务并核对卡片，手动恢复不会自动接回原 worker。
 
 - SQLite 先记领取，再写 Notion「执行中」和运行 ID，确认成功后启动进程。
 - Agent 完成后先保存完整交付，再逐片回写正文和评论，最后更新状态。结果响应丢失时根据运行标记对账，不重新执行 Agent。
@@ -120,10 +134,10 @@ systemctl --user disable --now notion-agent
 python3 -m unittest discover -s tests -v
 ```
 
-模拟测试覆盖重复领取、写入成功但响应丢失、回写重试不重执行、人工改派、空正文、未知项目、多机筛选、重置重派、进程身份、启动窗口崩溃、子进程超时及 Git worktree 隔离。
+模拟测试覆盖重复领取、写入成功但响应丢失、回写重试不重执行、人工改派、空正文、未知项目、多机筛选、重置重派、进程身份、启动窗口崩溃、子进程超时及项目目录直接执行。
 
 已通过 Notion 插件读需求、读真实 schema 和原卡片，并增量补齐机器、项目、运行 ID、运行摘要及「需处理」状态；已有卡片未修改。本机 Codex 和 Claude Code 参数通过已安装版本 help 核对。
 
-尚未完成：独立服务的 Notion token 授权、真实 Codex/Claude 任务闭环、后台 MCP/技能/OpenViking 加载验证、第二台机器验收及 launchd/systemd 实际安装。这些需要凭证和实际项目；当前不把模拟通过视为线上通过。
+已通过真实 Codex 任务验证接单、执行、测试与结果回写，已安装本机 launchd 服务。Notion 项目表与直接目录执行另有针对性测试。尚未完成 Claude 真实闭环、后台 MCP/技能/OpenViking 全面验证、第二台机器及 systemd 验收。
 
 Notion 接口依据：[数据源查询](https://developers.notion.com/reference/query-a-data-source)、[追加结果块](https://developers.notion.com/reference/patch-block-children)、[数据源 schema](https://developers.notion.com/reference/update-a-data-source)。

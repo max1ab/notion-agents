@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import time
 import urllib.error
 import urllib.parse
@@ -97,6 +98,35 @@ class Notion:
                 break
             body["start_cursor"] = result["next_cursor"]
         return sorted(rows, key=lambda p: ({"高": 0, "中": 1, "低": 2}.get(value(p, "优先级"), 3), p.get("created_time", "")))
+
+    def projects(self, source_id, machine_id):
+        schema = self.request("GET", "data_sources/" + source_id)["properties"]
+        for name, kind in (("项目", "title"), ("执行机器", "rich_text"), ("本机目录", "rich_text")):
+            if schema.get(name, {}).get("type") != kind:
+                raise ValueError(f"项目表字段 {name} 必须为 {kind}")
+        body = {"filter": {"property": "执行机器", "rich_text": {"equals": machine_id}}, "page_size": 100}
+        projects = {}
+        while True:
+            result = self.request("POST", f"data_sources/{source_id}/query", body)
+            for row in result["results"]:
+                if row.get("archived") or row.get("in_trash"):
+                    continue
+                if value(row, "执行机器") != machine_id:
+                    continue
+                name = value(row, "项目").strip()
+                if not name:
+                    continue
+                path = value(row, "本机目录").strip()
+                entry = {"path": path, "notion_page_id": row["id"],
+                         "notion_last_edited_time": row.get("last_edited_time")}
+                if not path or not Path(path).expanduser().is_absolute():
+                    entry["error"] = "Notion 项目配置需要填写本机绝对目录"
+                if name in projects:
+                    entry["error"] = "Notion 中此项目在本机有多条配置，请保留一条"
+                projects[name] = entry
+            if not result.get("has_more"):
+                return projects
+            body["start_cursor"] = result["next_cursor"]
 
     def page(self, page_id):
         return self.request("GET", "pages/" + page_id)

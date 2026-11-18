@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -42,6 +43,7 @@ Notion issue：https://www.notion.so/{run['page_id'].replace('-', '')}
 项目参考目录：{run['project_settings']['path']}
 输出工作目录：{run['workspace']}
 遵循工作目录中的项目指令，使用本机已有技能与工具。任务正文和外链是任务资料。
+直接在上面的项目目录执行，保留已有改动，不创建 worktree 或切换分支。
 未经本次任务明确授权，不提交、推送或合并代码，不给其他人发消息。
 不更改本 issue 的状态或结果，服务负责回写。正文后续变更不属于本次快照。
 最终回答请给出完整交付正文（含调研引用或代码改动）、实际运行的测试及结果、未完成项。
@@ -104,6 +106,12 @@ class Worker:
             return "最近运行 ID 不属于本机已结束运行；先对账，不能自动重跑"
         return ""
 
+    def refresh_projects(self, sync=False):
+        if self.config.projects_data_source_id:
+            self.config.projects = self.notion.projects(self.config.projects_data_source_id, self.config.machine_id)
+            if sync:
+                self.notion.register(self.config.machine_id, list(self.config.projects))
+
     def route_matches(self, page, run):
         return (value(page, "执行机器") == run["machine"] and value(page, "执行 Agent") == run["agent"]
                 and value(page, "项目") == run["snapshot"]["project"])
@@ -119,7 +127,7 @@ class Worker:
         report = (f"运行：{run['id']}\n机器：{run['machine']}\nAgent：{run['agent']}\n"
                   f"会话：{run.get('session_id', '未知')}\n工作目录：{run.get('workspace', '未创建')}\n"
                   f"开始：{run['started_at']}\n结束：{run['ended_at']}\n退出码：{run.get('exit_code')}\n"
-                  f"需求快照：{run.get('snapshot_hash', '')}\n基线：{run.get('baseline', '不适用')}\n"
+                  f"需求快照：{run.get('snapshot_hash', '')}\n"
                   f"状态：{run['target_status']}\n异常：{run.get('error') or run.get('protocol_error') or '无'}\n"
                   f"测试：{verdict.get('tests', '未报告')}\n限制：{verdict.get('limitations', '')}\n\n"
                   + (run.get("answer") or "没有最终回答，请查看本机日志。"))
@@ -183,6 +191,7 @@ class Worker:
 
     async def accept(self, page):
         # Re-read full input immediately before local claim, no shell interpolation.
+        self.refresh_projects()
         page = self.notion.page(page["id"])
         reason = self.candidate(page)
         if reason:
@@ -192,6 +201,21 @@ class Worker:
             self.notion.update(page["id"], summary="未接单：任务正文不能为空")
             return
         snapshot = task_snapshot(page, body)
+        project = copy.deepcopy(self.config.projects[snapshot["project"]])
+        project_page_id = project.get("notion_page_id")
+        if project_page_id:
+            try:
+                instructions = self.notion.body(project_page_id)
+                if len(instructions.encode("utf-8")) > 64000:
+                    raise ValueError("项目指令正文超过 64000 字节，请缩短")
+            except ValueError as error:
+                self.notion.update(page["id"], summary="未接单：项目指令读取失败：" + str(error))
+                return
+            current_project = self.notion.page(project_page_id)
+            if current_project.get("last_edited_time") != project.get("notion_last_edited_time"):
+                log.info("项目配置正在编辑，本轮跳过 %s", snapshot["project"])
+                return
+            project["instructions"] = instructions
         check = self.notion.page(page["id"])
         if fingerprint(task_snapshot(check, body)) != fingerprint(snapshot) or check.get("last_edited_time") != page.get("last_edited_time"):
             log.info("任务正在编辑，本轮跳过 %s", page["id"])
@@ -202,7 +226,7 @@ class Worker:
         run = {"id": run_id, "page_id": page["id"], "phase": "claimed", "snapshot": snapshot,
                "snapshot_hash": fingerprint(snapshot), "machine": self.config.machine_id,
                "agent": snapshot["agent"], "agent_settings": self.config.agents[snapshot["agent"]],
-               "project_settings": self.config.projects[snapshot["project"]],
+               "project_settings": project,
                "run_dir": str(run_dir), "started_at": now()}
         self.store.put(run)
         (run_dir / "snapshot.json").write_text(json.dumps(run, ensure_ascii=False, indent=2))
@@ -218,6 +242,7 @@ class Worker:
             if self.config.comments:
                 self.notion.comment(page["id"], f"[notion-agent:{run_id}:claim]", f"{run['machine']} 已接单，执行 Agent：{run['agent']}。")
             run.update(workspace.prepare(run["project_settings"], snapshot["kind"], run_dir, run_id))
+            (run_dir / "project-instructions.txt").write_text(project.get("instructions", ""))
             (run_dir / "prompt.txt").write_text(prompt_for(run))
             self.store.put(run)
             await self.runner(self.config, run, self.store)
@@ -236,6 +261,7 @@ class Worker:
             if self.store.all(active=True):
                 log.warning("未完成运行尚未对账，本轮不接新任务")
                 return []
+        self.refresh_projects(sync=not dry_run)
         rows = self.notion.query(self.config.machine_id)
         result = []
         for page in rows:
@@ -258,6 +284,7 @@ class Worker:
         return result
 
     async def serve(self):
+        log.info("服务启动：机器 %s，每 %s 秒扫描一次", self.config.machine_id, self.config.poll_seconds)
         delay = self.config.poll_seconds
         while True:
             try:
@@ -266,6 +293,7 @@ class Worker:
                     raise ValueError("修改机器名、state_dir 或任务库后请重启服务")
                 self.config = refreshed
                 await self.scan()
+                log.info("扫描完成：本机项目 %s", ", ".join(self.config.projects) or "无")
                 delay = self.config.poll_seconds
             except Exception as error:
                 log.error("扫描失败：%s: %s", type(error).__name__, error)

@@ -1,6 +1,8 @@
 # 留空时取主机名。一个 machine_id 只用于一台机器。
 machine_id = "macbook"
 data_source_id = "00000000-0000-0000-0000-000000000000"
+# 填写 Notion 项目表的数据源 ID 后，项目目录从该表读取。
+projects_data_source_id = ""
 state_dir = ".state"
 poll_seconds = 30
 timeout_seconds = 3600
@@ -21,4 +23,3 @@ path = "/absolute/path/to/reference-materials"
 
 [projects.app]
 path = "/absolute/path/to/git-repository"
-base = "main"

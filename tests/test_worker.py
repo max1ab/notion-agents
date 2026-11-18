@@ -89,6 +89,50 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
     def worker(self):
         return Worker(self.config, self.notion, self.store, self.fake_runner)
 
+    def project_instructions(self, text):
+        self.config.projects["demo"].update(notion_page_id="project-page", notion_last_edited_time="v1")
+        original_page = self.notion.page
+        original_body = self.notion.body
+        self.notion.page = lambda id: {"last_edited_time": "v1"} if id == "project-page" else original_page(id)
+        self.notion.body = lambda id: text if id == "project-page" else original_body(id)
+
+    async def test_project_body_is_snapshotted_separately_from_task(self):
+        self.project_instructions("每次修改需要 review。\n保留已有改动。")
+        await self.worker().scan()
+        run = self.store.all()[0]
+        self.assertEqual(run["project_settings"]["instructions"], "每次修改需要 review。\n保留已有改动。")
+        self.assertEqual((Path(run["run_dir"]) / "project-instructions.txt").read_text(), run["project_settings"]["instructions"])
+        self.assertNotIn("每次修改需要 review", (Path(run["run_dir"]) / "prompt.txt").read_text())
+        self.config.projects["demo"]["instructions"] = "later edit"
+        self.assertNotEqual(self.store.all()[0]["project_settings"]["instructions"], "later edit")
+
+    async def test_project_body_failure_prevents_claim_and_execution(self):
+        self.project_instructions("instructions")
+        original = self.notion.body
+        def unsupported(id):
+            if id == "project-page":
+                raise ValueError("unsupported block")
+            return original(id)
+        self.notion.body = unsupported
+        await self.worker().scan()
+        self.assertEqual(self.calls, 0)
+        self.assertFalse(self.store.all())
+        self.assertEqual(value(self.notion.p, "状态"), "待办")
+
+    async def test_project_edit_during_read_skips_launch(self):
+        self.project_instructions("instructions")
+        original = self.notion.page
+        self.notion.page = lambda id: {"last_edited_time": "v2"} if id == "project-page" else original(id)
+        await self.worker().scan()
+        self.assertEqual(self.calls, 0)
+        self.assertFalse(self.store.all())
+
+    async def test_default_project_instructions_are_not_inherited(self):
+        self.config.projects["default"] = {"path": str(self.root), "instructions": "default-only"}
+        await self.worker().scan()
+        run = self.store.all()[0]
+        self.assertNotIn("default-only", (Path(run["run_dir"]) / "project-instructions.txt").read_text())
+
     async def test_success_and_no_duplicate_scan(self):
         worker = self.worker()
         await worker.scan()
@@ -255,8 +299,46 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.notion.blocks), 1)
         self.assertEqual(self.store.all()[0]["phase"], "complete")
 
+    async def test_remote_projects_refresh_and_dry_run_does_not_sync(self):
+        self.config.projects_data_source_id = "remote"
+        remote = {"demo": {"path": str(self.root)}}
+        self.notion.projects = lambda source, machine: copy.deepcopy(remote)
+        syncs = []
+        self.notion.register = lambda machine, keys: syncs.append(keys)
+        worker = self.worker()
+        await worker.scan(dry_run=True)
+        self.assertFalse(syncs)
+        remote.clear()
+        rows = await worker.scan(dry_run=True)
+        self.assertFalse(rows[0]["eligible"])
+        self.assertFalse(self.config.projects)
+
+    async def test_remote_project_failure_never_uses_stale_mapping(self):
+        self.config.projects_data_source_id = "remote"
+        def unavailable(source, machine):
+            raise NotionError("offline")
+        self.notion.projects = unavailable
+        with self.assertRaises(NotionError):
+            await self.worker().scan()
+        self.assertEqual(self.calls, 0)
+
+
 
 class UnitTests(unittest.TestCase):
+    def test_project_instructions_use_executor_instruction_channels(self):
+        with tempfile.TemporaryDirectory() as td:
+            directory = Path(td)
+            instructions = '需要 review。\n引号 " 和 $(not-a-command) 保持原样。'
+            (directory / "project-instructions.txt").write_text(instructions)
+            settings = {"command": "/bin/example", "args": ["--example"]}
+            codex = command("Codex", settings, directory)
+            argument = codex[codex.index("-c") + 1]
+            self.assertEqual(json.loads(argument.split("=", 1)[1]), instructions)
+            self.assertTrue(argument.startswith("developer_instructions="))
+            claude = command("Claude Code", settings, directory)
+            self.assertEqual(claude[claude.index("--append-system-prompt") + 1], instructions)
+            self.assertEqual(settings["args"], ["--example"])
+
     def test_dotenv_relative_to_config_and_environment_precedence(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "config.toml"
@@ -328,24 +410,49 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(notion.result_chunk("page", "Agent result · run · 1/1", "hello"), "block")
         self.assertEqual(len(remote), 1)
 
-    def test_code_workspace_isolated_clean_baseline(self):
+    def test_both_task_types_use_existing_project_directory(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            repo = root / "repo"
-            repo.mkdir()
-            def git(*args):
-                return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
-            git("init", "-b", "main")
-            git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "base")
-            run = root / "run"
+            project = root / "project"
+            project.mkdir()
+            (project / "existing.txt").write_text("uncommitted user content")
+            run = root / "logs"
             run.mkdir()
-            data = prepare({"path": str(repo), "base": "main"}, "代码", run, "test")
-            (Path(data["workspace"]) / "new.txt").write_text("isolated")
-            self.assertFalse((repo / "new.txt").exists())
-            self.assertEqual(data["branch"], "notion/test")
-            (repo / "dirty.txt").write_text("dirty")
+            for kind in ("代码", "调研"):
+                data = prepare({"path": str(project)}, kind, run, "test")
+                self.assertEqual(data, {"workspace": str(project.resolve())})
+                self.assertEqual((project / "existing.txt").read_text(), "uncommitted user content")
+            self.assertFalse((run / "workspace").exists())
+            self.assertFalse((project / ".git").exists())
+
+    def test_missing_project_directory_not_created(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "missing"
             with self.assertRaises(ValueError):
-                prepare({"path": str(repo), "base": "main"}, "代码", root / "other", "other")
+                prepare({"path": str(missing)}, "代码", Path(td), "test")
+            self.assertFalse(missing.exists())
+
+    def test_notion_projects_pagination_duplicate_and_machine_filter(self):
+        notion = Notion("fake", "tasks")
+        schema = {"properties": {"项目": {"type": "title"}, "执行机器": {"type": "rich_text"}, "本机目录": {"type": "rich_text"}}}
+        def row(name, machine, directory, id):
+            return {"id": id, "properties": {"项目": {"type": "title", "title": rich(name)},
+                    "执行机器": {"type": "rich_text", "rich_text": rich(machine)},
+                    "本机目录": {"type": "rich_text", "rich_text": rich(directory)}}}
+        seen = []
+        def request(method, path, body=None):
+            seen.append((method, path, copy.deepcopy(body)))
+            if method == "GET":
+                return schema
+            if body.get("start_cursor"):
+                return {"results": [row("app", "mac", "/second", "2"), row("bad", "mac", "relative", "3")], "has_more": False}
+            return {"results": [row("app", "mac", "/first", "1"), row("other", "linux", "/other", "4")], "has_more": True, "next_cursor": "next"}
+        notion.request = request
+        projects = notion.projects("projects-source", "mac")
+        self.assertIn("多条配置", projects["app"]["error"])
+        self.assertIn("绝对目录", projects["bad"]["error"])
+        self.assertNotIn("other", projects)
+        self.assertEqual(seen[-1][2]["start_cursor"], "next")
 
     def test_env_does_not_forward_board_token_or_session(self):
         with tempfile.TemporaryDirectory() as td:

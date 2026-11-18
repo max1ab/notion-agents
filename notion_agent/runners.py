@@ -34,9 +34,15 @@ def process_alive(run):
 
 
 def command(agent_name, settings, run_dir):
-    args = settings.get("args", [])
+    args = list(settings.get("args", []))
+    instructions_file = run_dir / "project-instructions.txt"
+    instructions = instructions_file.read_text() if instructions_file.exists() else ""
     if agent_name == "Codex":
+        if instructions.strip():
+            args.extend(["-c", "developer_instructions=" + json.dumps(instructions, ensure_ascii=False)])
         return [settings["command"], "exec", *args, "--skip-git-repo-check", "--json", "-o", str(run_dir / "last-message.txt"), "-"]
+    if instructions.strip():
+        args.extend(["--append-system-prompt", instructions])
     return [settings["command"], "--print", *args, "--output-format", "stream-json", "--verbose"]
 
 
