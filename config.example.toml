@@ -1,0 +1,24 @@
+# 留空时取主机名。一个 machine_id 只用于一台机器。
+machine_id = "macbook"
+data_source_id = "00000000-0000-0000-0000-000000000000"
+state_dir = ".state"
+poll_seconds = 30
+timeout_seconds = 3600
+token_env = "NOTION_TOKEN"
+env_file = ".env"
+comments = true
+
+[agents.Codex]
+command = "/opt/homebrew/bin/codex"
+args = ["--sandbox", "workspace-write"]
+
+[agents."Claude Code"]
+command = "/opt/homebrew/bin/claude"
+args = ["--permission-mode", "dontAsk"]
+
+[projects.research]
+path = "/absolute/path/to/reference-materials"
+
+[projects.app]
+path = "/absolute/path/to/git-repository"
+base = "main"
