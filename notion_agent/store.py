@@ -36,7 +36,7 @@ class Store:
     def __init__(self, directory: Path):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.db = sqlite3.connect(directory / "runs.sqlite3")
-        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA journal_mode=DELETE")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, page_id TEXT, phase TEXT, data TEXT)")
         self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS active_page ON runs(page_id) WHERE phase != 'complete'")

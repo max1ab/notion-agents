@@ -433,6 +433,22 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class UnitTests(unittest.TestCase):
+    def test_existing_wal_database_migrates_without_losing_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = Store(root)
+            store.db.execute("PRAGMA journal_mode=WAL")
+            run = {"id": "saved", "page_id": "page", "phase": "complete"}
+            store.put(run)
+            store.db.close()
+            migrated = Store(root)
+            try:
+                self.assertEqual(migrated.db.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+                self.assertEqual(migrated.get("saved"), run)
+                self.assertEqual(migrated.db.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            finally:
+                migrated.db.close()
+
     def test_relation_query_filters_by_local_projects_and_deduplicates(self):
         notion = Notion("fake", "tasks")
         calls = []
