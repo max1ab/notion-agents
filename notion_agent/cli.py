@@ -55,7 +55,7 @@ def service_files(config, output):
     def quote(s):
         return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
     unit = ("[Unit]\nDescription=Notion local agent worker\nAfter=network-online.target\n\n[Service]\nType=simple\n"
-            + "WorkingDirectory=" + quote(root) + "\nExecStart=" + " ".join(map(quote, argv))
+            + "WorkingDirectory=" + str(root).replace("%", "%%") + "\nExecStart=" + " ".join(map(quote, argv))
             + "\nRestart=on-failure\nRestartSec=30\nTimeoutStopSec=30\nKillMode=control-group\nUMask=0077\n\n[Install]\nWantedBy=default.target\n")
     (output / "notion-agent.service").write_text(unit)
     print(f"服务文件已生成：{output.resolve()}")
