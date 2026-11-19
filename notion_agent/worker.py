@@ -109,6 +109,26 @@ class Worker:
         self.notion = notion
         self.store = store
         self.runner = runner
+        self.jobs = {}
+
+    def project_busy(self, page, directory=None):
+        if not self.jobs:
+            return False
+        key = project_key(page)
+        project = self.config.projects.get(key)
+        if directory is None and project and not project.get("error"):
+            try:
+                directory = Path(project["path"]).expanduser().resolve()
+            except (OSError, RuntimeError):
+                pass  # Normal validation handles an unusable project path.
+        return any(run["page_id"] == page["id"] or run["snapshot"]["project"] == key
+                   or (directory is not None and workspace.overlaps(directory, Path(run["workspace"])))
+                   for run, _ in self.jobs.values())
+
+    def finish_job(self, run_id, task):
+        self.jobs.pop(run_id)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            log.error("运行 %s 等待恢复：%s: %s", run_id, type(error).__name__, error)
 
     def candidate(self, page, trigger_agent=None):
         c = self.config
@@ -172,7 +192,7 @@ class Worker:
             if not directory or not Path(directory).expanduser().is_absolute():
                 return False
             return (value(project, "执行机器") == run["machine"]
-                    and Path(directory).expanduser().resolve() == Path(run["project_settings"]["path"]).resolve())
+                    and Path(directory).expanduser().resolve() == Path(run.get("workspace") or run["project_settings"]["path"]).resolve())
         return (value(page, "执行机器") == run["machine"] and value(page, "执行 Agent") == route_agent
                 and value(page, "项目") == run["snapshot"]["project"])
 
@@ -202,6 +222,8 @@ class Worker:
 
     def recover(self):
         for run in self.store.all(active=True):
+            if run["id"] in self.jobs:
+                continue  # This worker still owns the live coroutine, including its spawn window.
             if run["phase"] in ("spawning", "running", "claimed"):
                 if process_alive(run):
                     log.error("运行 %s 的旧进程仍存在，暂停接单", run["id"])
@@ -321,10 +343,12 @@ class Worker:
             return
         self.notion.update(page["id"], status="草稿", summary="未接单：" + reason)
 
-    async def accept(self, page, trigger=None, agent=None, comments=()):
+    async def accept(self, page, trigger=None, agent=None, comments=(), *, background=False):
         # Re-read full input immediately before local claim, no shell interpolation.
         self.refresh_projects()
         page = self.notion.page(page["id"])
+        if background and self.project_busy(page):
+            return
         def decline(reason):
             if trigger:
                 self.comment_problem(page, trigger, agent, reason)
@@ -348,7 +372,8 @@ class Worker:
         primary = not trigger or agent == owner
         previous = next((r for r in reversed(history) if r["agent"] == agent), None) if trigger else None
         if previous and (previous["snapshot"]["project"] != snapshot["project"]
-                         or Path(previous["project_settings"]["path"]).resolve() != Path(self.config.projects[snapshot["project"]]["path"]).resolve()):
+                         or Path(previous.get("workspace") or previous["project_settings"]["path"]).resolve()
+                         != Path(self.config.projects[snapshot["project"]]["path"]).expanduser().resolve()):
             raise ValueError("评论续办的项目或目录已变化；请先人工核对原会话")
         previous_session = (previous.get("session_id") or previous.get("resume_session_id")) if previous else None
         if previous and not previous_session:
@@ -384,13 +409,20 @@ class Worker:
             return
         run_id = str(uuid.uuid4())
         run_dir = self.config.state_dir / "runs" / run_id
+        try:
+            prepared = workspace.prepare(project, snapshot["kind"], run_dir, run_id)
+        except ValueError as error:
+            decline(str(error))
+            return
+        if background and self.project_busy(page, Path(prepared["workspace"])):
+            return
         run_dir.mkdir(parents=True, mode=0o700)
         run = {"id": run_id, "page_id": page["id"], "phase": "claimed", "snapshot": snapshot,
                "snapshot_hash": fingerprint(snapshot), "machine": self.config.machine_id,
                "agent": agent or snapshot["agent"], "agent_settings": self.config.agents[agent or snapshot["agent"]],
                "project_settings": project,
                "run_dir": str(run_dir), "started_at": now(), "delivery_format": "conversation",
-               "workspace_guide": {"page_id": self.config.agent_guide_page_id, "content": guide}}
+               "workspace_guide": {"page_id": self.config.agent_guide_page_id, "content": guide}, **prepared}
         run["execution_data_source_id"] = self.config.execution_data_source_id
         run["primary"] = primary
         if trigger:
@@ -410,20 +442,28 @@ class Worker:
             self.seal(run, "启动前路由或状态变化，未启动 Agent")
             self.deliver(run)
             return
+        if background:
+            job = asyncio.create_task(self.run_claimed(run, self.config))
+            self.jobs[run_id] = (run, job)
+            job.add_done_callback(lambda task: self.finish_job(run_id, task))
+        else:
+            await self.run_claimed(run, self.config)
+
+    async def run_claimed(self, run, config):
+        run_dir = Path(run["run_dir"])
         try:
             try:
                 self.sync_execution(run)
             except NotionError as error:
                 log.warning("开始时间记录暂未确认，结束后重试：%s", error)
-            if self.config.comments:
+            if config.comments:
                 _, run["discussion_id"] = self.conversation_message(run, "claim", f"{run['agent']} 开始处理这个任务。", run.get("discussion_id"))
                 self.store.put(run)
-            run.update(workspace.prepare(run["project_settings"], snapshot["kind"], run_dir, run_id))
-            (run_dir / "project-instructions.txt").write_text(project.get("instructions", ""))
-            (run_dir / "workspace-guide.txt").write_text(guide)
+            (run_dir / "project-instructions.txt").write_text(run["project_settings"].get("instructions", ""))
+            (run_dir / "workspace-guide.txt").write_text(run["workspace_guide"]["content"])
             (run_dir / "prompt.txt").write_text(prompt_for(run))
             self.store.put(run)
-            await self.runner(self.config, run, self.store)
+            await self.runner(config, run, self.store)
         except asyncio.CancelledError:
             self.seal(run, "服务停止，任务中断；请检查保留的工作区和日志")
             raise
@@ -433,14 +473,16 @@ class Worker:
             self.seal(run)
         self.deliver(run)
 
-    async def scan(self, dry_run=False):
+    async def scan(self, dry_run=False, *, background=False):
         if not dry_run:
             self.recover()
-            if self.store.all(active=True):
+            if any(not background or run["id"] not in self.jobs for run in self.store.all(active=True)):
                 log.warning("未完成运行尚未对账，本轮不接新任务")
                 return []
+            if background and len(self.jobs) >= self.config.max_parallel_projects:
+                return []
         self.refresh_projects(sync=not dry_run)
-        if not dry_run and await self.scan_comments():
+        if not dry_run and await self.scan_comments(background=background):
             return []
         if getattr(self.notion, "project_property_type", None) == "relation":
             rows = self.notion.query(self.config.machine_id, project_ids=list(self.config.projects))
@@ -448,6 +490,8 @@ class Worker:
             rows = self.notion.query(self.config.machine_id)
         result = []
         for page in rows:
+            if background and self.project_busy(page):
+                continue
             reason = self.candidate(page)
             if not reason:
                 try:
@@ -461,12 +505,12 @@ class Worker:
             if reason:
                 self.reject(page, reason)
                 continue
-            await self.accept(page)
+            await self.accept(page, background=background)
             # Single task per scan; poll picks up freshly edited priorities/configuration.
             break
         return result
 
-    async def scan_comments(self):
+    async def scan_comments(self, *, background=False):
         """Poll all local issues, regardless of status; durable triggers prevent replay."""
         if getattr(self.notion, "project_property_type", None) == "relation":
             rows = self.notion.query(self.config.machine_id, project_ids=list(self.config.projects), status=None)
@@ -474,7 +518,7 @@ class Worker:
             rows = self.notion.query(self.config.machine_id, status=None)
         since = datetime.fromisoformat(self.store.comments_since)
         for page in rows:
-            if page.get("archived") or page.get("in_trash"):
+            if page.get("archived") or page.get("in_trash") or (background and self.project_busy(page)):
                 continue
             comments = self.notion.list_comments(page["id"])
             sent_ids = self.store.sent_comment_ids(page["id"])
@@ -495,7 +539,7 @@ class Worker:
                         self.comment_problem(page, comment, agent, reason)
                         continue
                     try:
-                        await self.accept(page, comment, agent, comments[:comments.index(comment) + 1])
+                        await self.accept(page, comment, agent, comments[:comments.index(comment) + 1], background=background)
                     except ValueError as error:
                         self.comment_problem(page, comment, agent, str(error))
                     if self.store.triggered(page["id"], comment["id"], agent):
@@ -512,16 +556,27 @@ class Worker:
     async def serve(self):
         log.info("服务启动：机器 %s，每 %s 秒扫描一次", self.config.machine_id, self.config.poll_seconds)
         delay = self.config.poll_seconds
-        while True:
-            try:
-                refreshed = load(self.config.path)
-                if refreshed.state_dir != self.config.state_dir or refreshed.machine_id != self.config.machine_id or refreshed.data_source_id != self.config.data_source_id:
-                    raise ValueError("修改机器名、state_dir 或任务库后请重启服务")
-                self.config = refreshed
-                await self.scan()
-                log.info("扫描完成：本机项目 %s", ", ".join(p.get("name", k) for k, p in self.config.projects.items()) or "无")
-                delay = self.config.poll_seconds
-            except Exception as error:
-                log.error("扫描失败：%s: %s", type(error).__name__, error)
-                delay = min(max(delay * 2, 1), 300)
-            await asyncio.sleep(delay)
+        try:
+            while True:
+                try:
+                    refreshed = load(self.config.path)
+                    if refreshed.state_dir != self.config.state_dir or refreshed.machine_id != self.config.machine_id or refreshed.data_source_id != self.config.data_source_id:
+                        raise ValueError("修改机器名、state_dir 或任务库后请重启服务")
+                    self.config = refreshed
+                    for _ in range(max(0, refreshed.max_parallel_projects - len(self.jobs))):
+                        before = len(self.jobs)
+                        await self.scan(background=True)
+                        if len(self.jobs) == before:
+                            break
+                        await asyncio.sleep(0)
+                    log.info("扫描完成：本机项目 %s", ", ".join(p.get("name", k) for k, p in self.config.projects.items()) or "无")
+                    delay = self.config.poll_seconds
+                except Exception as error:
+                    log.error("扫描失败：%s: %s", type(error).__name__, error)
+                    delay = min(max(delay * 2, 1), 300)
+                await asyncio.sleep(delay)
+        finally:
+            jobs = [job for _, job in self.jobs.values()]
+            for job in jobs:
+                job.cancel()
+            await asyncio.gather(*jobs, return_exceptions=True)

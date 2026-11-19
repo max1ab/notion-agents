@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -29,6 +30,7 @@ def page(machine="test-machine", agent="Codex", kind="调研"):
 class FakeNotion:
     def __init__(self, p):
         self.p = p
+        self.extra_pages = {}
         self.blocks = {}
         self.comments = {}
         self.comment_names = {}
@@ -54,33 +56,40 @@ class FakeNotion:
         self.timing_writes.append(copy.deepcopy(stats))
         if stats:
             for name, key in {"最近耗时（秒）": "latest_seconds", "累计耗时（秒）": "total_seconds", "执行次数": "execution_count"}.items():
-                self.p["properties"][name] = {"type": "number", "number": stats[key]}
+                self.card(page_id)["properties"][name] = {"type": "number", "number": stats[key]}
 
     def query(self, machine, project_ids=None, status="待办"):
-        if project_ids is not None:
-            ids = [x["id"] for x in self.p.get("properties", {}).get("项目", {}).get("relation", [])]
-            if not set(ids).intersection(project_ids):
-                return []
-        return [copy.deepcopy(self.p)] if status is None or value(self.p, "状态") == status else []
+        rows = []
+        for card in (self.p, *self.extra_pages.values()):
+            if project_ids is not None:
+                ids = [x["id"] for x in card.get("properties", {}).get("项目", {}).get("relation", [])]
+                if not set(ids).intersection(project_ids):
+                    continue
+            if status is None or value(card, "状态") == status:
+                rows.append(copy.deepcopy(card))
+        return rows
 
-    def list_comments(self, _):
-        return getattr(self, "incoming_comments", [])
+    def list_comments(self, page_id):
+        return getattr(self, "incoming_comments", []) if page_id == self.p["id"] else []
 
     def comment_author_is_bot(self, comment):
         return comment.get("created_by", {}).get("type") == "bot"
 
-    def page(self, _):
-        return copy.deepcopy(self.p)
+    def card(self, page_id):
+        return self.extra_pages.get(page_id, self.p)
+
+    def page(self, page_id):
+        return copy.deepcopy(self.card(page_id))
 
     def body(self, _):
         return self.body_text
 
-    def update(self, _, status=None, run_id=None, summary=None):
+    def update(self, page_id, status=None, run_id=None, summary=None):
         self.writes.append((status, run_id, summary))
         for key, val in (("状态", status), ("最近运行 ID", run_id), ("运行摘要", summary)):
             if val is not None:
                 t = "status" if key == "状态" else "rich_text"
-                self.p["properties"][key] = {"type": t, t: {"name": val} if t == "status" else rich(val)}
+                self.card(page_id)["properties"][key] = {"type": t, t: {"name": val} if t == "status" else rich(val)}
 
     def result_chunk(self, page_id, marker, text):
         self.blocks.setdefault(marker, text)
@@ -144,6 +153,79 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
                    "rich_text": rich(text)}
         self.notion.incoming_comments = getattr(self.notion, "incoming_comments", []) + [comment]
         return comment
+
+    def add_card(self, page_id, project):
+        card = page()
+        card["id"] = page_id
+        card["properties"]["项目"]["select"]["name"] = project
+        self.notion.extra_pages[page_id] = card
+
+    async def test_service_runs_independent_directories_and_waits_for_all_jobs_on_shutdown(self):
+        first = self.root / "first"
+        child = first / "child"
+        alias = self.root / "alias"
+        second = self.root / "second"
+        third = self.root / "third"
+        child.mkdir(parents=True)
+        second.mkdir()
+        third.mkdir()
+        alias.symlink_to(first, target_is_directory=True)
+        config = tomllib.loads(self.path.read_text())
+        config.update(poll_seconds=1, projects={name: {"path": str(path)} for name, path in (
+            ("demo", first), ("alias", alias), ("child", child), ("second", second), ("third", third))})
+        save(config, self.path)
+        for project in ("alias", "child", "second", "third"):
+            self.add_card(project, project)
+
+        started = asyncio.Queue()
+        release_second = asyncio.Event()
+        cancelled = set()
+
+        async def runner(cfg, run, store):
+            page_id = run["page_id"]
+            started.put_nowait(page_id)
+            try:
+                if page_id == "second":
+                    await release_second.wait()
+                    await self.fake_runner(cfg, run, store)
+                else:
+                    await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.add(page_id)
+                raise
+
+        worker = Worker(self.config, self.notion, self.store, runner)
+        serving = asyncio.create_task(worker.serve())
+        try:
+            first_batch = {await asyncio.wait_for(started.get(), 5) for _ in range(2)}
+            self.assertEqual(first_batch, {"page-1", "second"})
+            self.assertEqual(len(worker.jobs), 2)
+            self.assertEqual(value(self.notion.p, "状态"), "执行中")
+            for waiting in ("alias", "child", "third"):
+                self.assertEqual(value(self.notion.card(waiting), "状态"), "待办")
+            comment = self.incoming("@codex 等当前任务结束再继续")
+            release_second.set()
+            self.assertEqual(await asyncio.wait_for(started.get(), 5), "third")
+            self.assertFalse(self.store.triggered("page-1", comment["id"], "Codex"))
+            self.assertEqual(value(self.notion.p, "状态"), "执行中")
+            self.assertEqual(value(self.notion.card("second"), "状态"), "待我验收")
+        finally:
+            serving.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await serving
+        self.assertEqual(cancelled, {"page-1", "third"})
+        self.assertFalse(worker.jobs)
+        self.assertEqual({r["phase"] for r in self.store.all(active=True)}, {"delivering"})
+        self.worker().recover()
+        self.assertFalse(self.store.all(active=True))
+        for stopped in ("page-1", "third"):
+            self.assertEqual(value(self.notion.card(stopped), "状态"), "需处理")
+
+    async def test_once_still_runs_only_one_pending_card(self):
+        self.add_card("page-2", "demo")
+        await self.worker().scan()
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(value(self.notion.card("page-2"), "状态"), "待办")
 
     async def test_comment_resumes_codex_and_survives_store_restart(self):
         await self.worker().scan()

@@ -14,3 +14,17 @@ def validate(project, kind):
 def prepare(project, kind, run_dir, run_id):
     validate(project, kind)
     return {"workspace": str(Path(project["path"]).expanduser().resolve())}
+
+
+def overlaps(first: Path, second: Path):
+    if first.is_relative_to(second) or second.is_relative_to(first):
+        return True
+    # Different spellings can refer to the same directory on case-insensitive volumes.
+    for directory, other in ((first, second), (second, first)):
+        for ancestor in (other, *other.parents):
+            try:
+                if directory.samefile(ancestor):
+                    return True
+            except OSError:
+                continue
+    return False

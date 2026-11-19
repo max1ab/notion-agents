@@ -10,6 +10,8 @@ execution_data_source_id = ""
 state_dir = ".state"
 poll_seconds = 30
 timeout_seconds = 3600
+# 每台机器最多同时运行多少个互不重叠的项目目录；1 为串行。
+max_parallel_projects = 2
 token_env = "NOTION_TOKEN"
 env_file = ".env"
 comments = true

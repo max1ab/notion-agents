@@ -53,6 +53,7 @@ class Config:
     projects_data_source_id: str | None = None
     agent_guide_page_id: str | None = None
     execution_data_source_id: str | None = None
+    max_parallel_projects: int = 2
 
     def token(self):
         value = os.environ.get(self.token_env, "")
@@ -93,6 +94,9 @@ def load(path: Path) -> Config:
     timeout = float(data.get("timeout_seconds", 3600))
     if poll < 1 or timeout < 1:
         raise ValueError("poll_seconds 和 timeout_seconds 必须至少为 1")
+    parallel = data.get("max_parallel_projects", 2)
+    if type(parallel) is not int or parallel < 1:
+        raise ValueError("max_parallel_projects 必须为正整数")
     return Config(path, machine, data["data_source_id"], local(data.get("state_dir", ".state")),
                   poll, timeout, data.get("token_env", "NOTION_TOKEN"),
                   local(data["token_file"]) if data.get("token_file") else None,
@@ -100,7 +104,8 @@ def load(path: Path) -> Config:
                   env_file=local(data.get("env_file", ".env")),
                   projects_data_source_id=data.get("projects_data_source_id") or None,
                   agent_guide_page_id=data.get("agent_guide_page_id") or None,
-                  execution_data_source_id=data.get("execution_data_source_id") or None)
+                  execution_data_source_id=data.get("execution_data_source_id") or None,
+                  max_parallel_projects=parallel)
 
 
 def save(data: dict, path: Path):
@@ -128,6 +133,7 @@ def initial():
             "data_source_id": "00000000-0000-0000-0000-000000000000",
             "projects_data_source_id": "",
             "state_dir": ".state", "poll_seconds": 30, "timeout_seconds": 3600,
+            "max_parallel_projects": 2,
             "token_env": "NOTION_TOKEN", "env_file": ".env", "comments": True,
             "agents": {"Codex": {"command": shutil.which("codex") or "/usr/local/bin/codex",
                                    "args": ["--sandbox", "workspace-write"]},
