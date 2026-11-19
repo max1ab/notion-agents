@@ -106,7 +106,10 @@ def run(args):
     store = Store(config.state_dir)
     if args.action == "status":
         for r in store.all():
-            print(json.dumps({key: r.get(key) for key in ("id", "page_id", "phase", "agent", "workspace", "session_id", "error")}, ensure_ascii=False))
+            print(json.dumps({key: r.get(key) for key in ("id", "page_id", "phase", "agent", "workspace", "session_id", "error",
+                                                          "delivery_error", "delivery_attempts")}, ensure_ascii=False))
+        for item in store.pending_stats():
+            print(json.dumps({"pending_stats": item["channel"], **item}, ensure_ascii=False))
         return
     if args.action == "logs":
         r = store.get(args.run_id)
@@ -166,8 +169,7 @@ def run(args):
         return
     with machine_lock(config):
         notion.check_schema()
-        if config.execution_data_source_id:
-            notion.check_execution_schema(config.execution_data_source_id)
+        # The optional execution table is checked by the statistics queue on use.
         worker = Worker(config, notion, store)
         async def work():
             loop = asyncio.get_running_loop()

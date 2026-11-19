@@ -8,7 +8,7 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import workspace
@@ -17,6 +17,9 @@ from .notion import value, project_key, text_of, NotionError
 from .runners import execute, process_alive, parse_events
 
 log = logging.getLogger(__name__)
+
+# A sealed run waiting for reconciliation blocks only its own issue, silently.
+WAITING = "存在未结束的本地运行，等待对账"
 
 
 def now():
@@ -131,6 +134,9 @@ class Worker:
             log.error("运行 %s 等待恢复：%s: %s", run_id, type(error).__name__, error)
 
     def candidate(self, page, trigger_agent=None):
+        # Checked first: a human edit to a waiting issue must never be rejected back to draft.
+        if any(r["phase"] != "complete" for r in self.store.history(page["id"])):
+            return WAITING
         c = self.config
         relation = page.get("properties", {}).get("项目", {}).get("type") == "relation"
         if (not trigger_agent and value(page, "状态") != "待办") or (not relation and value(page, "执行机器") != c.machine_id):
@@ -156,8 +162,6 @@ class Worker:
             workspace.validate(project, kind)
         except ValueError as e:
             return str(e)
-        if any(r["phase"] != "complete" for r in self.store.history(page["id"])):
-            return "存在未结束的本地运行"
         last = self.store.latest_primary(page["id"])
         if value(page, "最近运行 ID") and (not last or last["id"] != value(page, "最近运行 ID")):
             return "最近运行 ID 不属于本机已结束运行；先对账，不能自动重跑"
@@ -218,32 +222,89 @@ class Worker:
                 answer = "这次执行中断了，以下是已保存的回复，尚需核对：\n\n" + answer
             run["reply_chunks"] = [answer[i:i + 18000] for i in range(0, len(answer), 18000)]
         run.update(phase="delivering", sent_chunks=run.get("sent_chunks", {}))
-        self.store.put(run)
+        self.store.put(run, stats=self.execution_stats(run))
+
+    def execution_stats(self, run):
+        return [("execution", run["id"])] if run.get("execution_data_source_id", self.config.execution_data_source_id) else []
+
+    def timing_stats(self, run):
+        return [("timings", run["page_id"])] if getattr(self.notion, "timing_enabled", True) else []
+
+    def guards_machine(self, run):
+        # Unsealed runs or surviving PIDs may still write the directory; sealed ones wait on their own issue.
+        return run["id"] not in self.jobs and (not run.get("ended_at") or process_alive(run))
 
     def recover(self):
         for run in self.store.all(active=True):
             if run["id"] in self.jobs:
                 continue  # This worker still owns the live coroutine, including its spawn window.
-            if run["phase"] in ("spawning", "running", "claimed"):
-                if process_alive(run):
-                    log.error("运行 %s 的旧进程仍存在，暂停接单", run["id"])
-                    continue
-                # A crash in the spawn-before-PID-save window cannot establish process death.
-                if run["phase"] == "spawning" and not run.get("pid"):
-                    run.update(phase="hold", error="启动窗口崩溃，进程身份未知；检查本机进程后手动 resolve")
-                    self.store.put(run)
-                    continue
-                event_file = Path(run["run_dir"]) / "events.jsonl"
-                if event_file.exists():
-                    run.update(parse_events(event_file, run["agent"]))
-                self.seal(run, "服务曾中断，未自动重跑；请检查原会话、日志及工作区")
-            if run["phase"] == "delivering":
-                self.deliver(run)
+            try:
+                if run["phase"] in ("spawning", "running", "claimed"):
+                    if process_alive(run):
+                        log.error("运行 %s 的旧进程仍存在，暂停接单", run["id"])
+                        continue
+                    # A crash in the spawn-before-PID-save window cannot establish process death.
+                    if run["phase"] == "spawning" and not run.get("pid"):
+                        run.update(phase="hold", error="启动窗口崩溃，进程身份未知；检查本机进程后手动 resolve")
+                        self.store.put(run)
+                        continue
+                    event_file = Path(run["run_dir"]) / "events.jsonl"
+                    if event_file.exists():
+                        run.update(parse_events(event_file, run["agent"]))
+                    self.seal(run, "服务曾中断，未自动重跑；请检查原会话、日志及工作区")
+                if run["phase"] == "delivering":
+                    self.try_deliver(run)
+            except Exception as error:
+                log.error("运行 %s 恢复失败，只暂停该任务：%s: %s", run["id"], type(error).__name__, error)
+
+    def try_deliver(self, run):
+        """The sealed result is already local; delivery failures stay with this issue."""
+        if process_alive(run):
+            log.warning("运行 %s 的进程尚未结束，暂不交付", run["id"])
+            return
+        try:
+            self.deliver(run)
+        except Exception as error:
+            run.update(delivery_error=f"{type(error).__name__}: {error}", delivery_failed_at=now(),
+                       delivery_attempts=run.get("delivery_attempts", 0) + 1)
+            self.store.put(run)
+            log.error("交付 %s 暂未完成，只暂停该任务：%s", run["id"], run["delivery_error"])
+        self.flush_stats(run)
+
+    def complete(self, run):
+        run["phase"] = "complete"
+        run.pop("delivery_error", None)
+        self.store.put(run, stats=self.timing_stats(run))
+
+    def flush_stats(self, run=None):
+        """Retry timeline rows and timing fields without touching delivery or execution."""
+        current = datetime.now(timezone.utc)
+        for item in self.store.pending_stats():
+            if run is not None and item["run_id"] != run["id"]:
+                continue
+            if item["next_at"] and datetime.fromisoformat(item["next_at"]) > current:
+                continue
+            try:
+                if item["channel"] == "timings":
+                    self.notion.update_timings(item["page_id"], self.store.timing_stats(item["page_id"]))
+                else:
+                    # Reuse the live dict so its record receipt is never overwritten by a stale copy.
+                    target = run if run is not None else (self.jobs[item["run_id"]][0] if item["run_id"] in self.jobs
+                                                          else self.store.get(item["run_id"]))
+                    if target:
+                        self.sync_execution(target)
+            except Exception as error:
+                delay = min(60 * 2 ** item["attempts"], 3600)
+                self.store.stats_failed(item, f"{type(error).__name__}: {error}",
+                                        (current + timedelta(seconds=delay)).isoformat())
+                log.warning("统计补写 %s %s 暂未完成，%s 秒后重试：%s", item["channel"], item["key"], delay, error)
+            else:
+                self.store.stats_done(item)
 
     def deliver(self, run):
-        # This row describes the immutable run, even if the issue was rerouted.
-        self.sync_execution(run)
         page = self.notion.page(run["page_id"])
+        if page.get("archived") or page.get("in_trash"):
+            raise NotionError("任务页已删除或移入回收站；本地结果已保留，恢复页面后自动补交")
         if not run.get("primary", True):
             if not self.route_matches(page, run):
                 run.update(phase="hold", error="附属 Agent 执行期间路由变化，请人工对账")
@@ -283,10 +344,8 @@ class Worker:
             self.store.put(run)
             return
         summary = "已完成，等你验收。" if run["target_status"] == "待我验收" else "任务需要你处理，请查看回复。"
-        self.notion.update_timings(run["page_id"], self.store.timing_stats(run["page_id"]))
         self.notion.update(run["page_id"], status=run["target_status"], summary=summary)
-        run["phase"] = "complete"
-        self.store.put(run)
+        self.complete(run)
         log.info("交付 %s -> %s", run["id"], run["target_status"])
 
     def conversation_message(self, run, key, message, discussion_id=None):
@@ -313,10 +372,9 @@ class Worker:
         if not run.get("primary", True):
             if not self.route_matches(self.notion.page(run["page_id"]), run):
                 run.update(phase="hold", error="附属 Agent 交付期间路由变化，请人工对账")
+                self.store.put(run)
             else:
-                self.notion.update_timings(run["page_id"], self.store.timing_stats(run["page_id"]))
-                run["phase"] = "complete"
-            self.store.put(run)
+                self.complete(run)
             return
         page = self.notion.page(run["page_id"])
         if (value(page, "最近运行 ID") != run["id"] or not self.route_matches(page, run)
@@ -325,10 +383,8 @@ class Worker:
             self.store.put(run)
             return
         summary = "已完成，等你验收。" if run["target_status"] == "待我验收" else "任务需要你处理，请查看回复。"
-        self.notion.update_timings(run["page_id"], self.store.timing_stats(run["page_id"]))
         self.notion.update(run["page_id"], status=run["target_status"], summary=summary)
-        run["phase"] = "complete"
-        self.store.put(run)
+        self.complete(run)
         log.info("评论交付 %s -> %s", run["id"], run["target_status"])
 
     def reject(self, page, reason):
@@ -355,6 +411,8 @@ class Worker:
             else:
                 self.reject(page, reason)
         reason = self.candidate(page, agent)
+        if reason == WAITING:
+            return  # Never overwrite a status that is still awaiting reconciliation.
         if reason:
             decline(reason)
             return
@@ -440,7 +498,7 @@ class Worker:
         check = self.notion.page(page["id"])
         if (primary and (value(check, "最近运行 ID") != run_id or value(check, "状态") != "执行中")) or not self.route_matches(check, run):
             self.seal(run, "启动前路由或状态变化，未启动 Agent")
-            self.deliver(run)
+            self.try_deliver(run)
             return
         if background:
             job = asyncio.create_task(self.run_claimed(run, self.config))
@@ -452,10 +510,9 @@ class Worker:
     async def run_claimed(self, run, config):
         run_dir = Path(run["run_dir"])
         try:
-            try:
-                self.sync_execution(run)
-            except NotionError as error:
-                log.warning("开始时间记录暂未确认，结束后重试：%s", error)
+            # The start row is best effort; a failure stays queued and never delays the Agent.
+            self.store.put(run, stats=self.execution_stats(run))
+            self.flush_stats(run)
             if config.comments:
                 _, run["discussion_id"] = self.conversation_message(run, "claim", f"{run['agent']} 开始处理这个任务。", run.get("discussion_id"))
                 self.store.put(run)
@@ -471,13 +528,14 @@ class Worker:
             self.seal(run, f"{type(error).__name__}: {error}")
         else:
             self.seal(run)
-        self.deliver(run)
+        self.try_deliver(run)
 
     async def scan(self, dry_run=False, *, background=False):
         if not dry_run:
             self.recover()
-            if any(not background or run["id"] not in self.jobs for run in self.store.all(active=True)):
-                log.warning("未完成运行尚未对账，本轮不接新任务")
+            self.flush_stats()
+            if guarded := [run["id"] for run in self.store.all(active=True) if self.guards_machine(run)]:
+                log.warning("运行 %s 的进程可能仍在执行，本轮不接新任务", ", ".join(guarded))
                 return []
             if background and len(self.jobs) >= self.config.max_parallel_projects:
                 return []
@@ -492,20 +550,35 @@ class Worker:
         for page in rows:
             if background and self.project_busy(page):
                 continue
-            reason = self.candidate(page)
-            if not reason:
-                try:
-                    if not self.notion.body(page["id"]).strip():
-                        reason = "任务正文不能为空"
-                except ValueError as error:
-                    reason = str(error)
+            try:
+                reason = self.candidate(page)
+                if not reason:
+                    try:
+                        if not self.notion.body(page["id"]).strip():
+                            reason = "任务正文不能为空"
+                    except ValueError as error:
+                        reason = str(error)
+            except Exception as error:
+                # One unreadable card must not stop the rest of the queue.
+                log.error("任务 %s 读取失败，本轮跳过：%s: %s", page["id"], type(error).__name__, error)
+                result.append({"id": page["id"], "title": value(page, "任务"), "eligible": False, "reason": f"读取失败：{error}"})
+                continue
             result.append({"id": page["id"], "title": value(page, "任务"), "eligible": not bool(reason), "reason": reason})
             if dry_run:
                 continue
-            if reason:
-                self.reject(page, reason)
+            if reason == WAITING:
+                log.info("任务 %s 等待本地运行对账，本轮跳过", page["id"])
                 continue
-            await self.accept(page, background=background)
+            claimed = len(self.store.history(page["id"]))
+            try:
+                if reason:
+                    self.reject(page, reason)
+                    continue
+                await self.accept(page, background=background)
+            except Exception as error:
+                log.error("任务 %s 处理失败，只影响该任务：%s: %s", page["id"], type(error).__name__, error)
+                if len(self.store.history(page["id"])) == claimed:
+                    continue
             # Single task per scan; poll picks up freshly edited priorities/configuration.
             break
         return result
@@ -520,30 +593,43 @@ class Worker:
         for page in rows:
             if page.get("archived") or page.get("in_trash") or (background and self.project_busy(page)):
                 continue
-            comments = self.notion.list_comments(page["id"])
-            sent_ids = self.store.sent_comment_ids(page["id"])
-            for comment in comments:
-                # Personal API tokens can attribute our replies to a person.
-                # Receipts distinguish them from that same person's real requests.
-                if comment["id"] in sent_ids:
+            claimed = len(self.store.history(page["id"]))
+            try:
+                if await self.scan_page_comments(page, since, background):
+                    return True
+            except Exception as error:
+                log.error("任务 %s 评论处理失败，只影响该任务：%s: %s", page["id"], type(error).__name__, error)
+                if len(self.store.history(page["id"])) != claimed:
+                    return True
+        return False
+
+    async def scan_page_comments(self, page, since, background):
+        comments = self.notion.list_comments(page["id"])
+        sent_ids = self.store.sent_comment_ids(page["id"])
+        for comment in comments:
+            # Personal API tokens can attribute our replies to a person.
+            # Receipts distinguish them from that same person's real requests.
+            if comment["id"] in sent_ids:
+                continue
+            if datetime.fromisoformat(comment["created_time"].replace("Z", "+00:00")) < since:
+                continue
+            agents = mentioned_agents(text_of(comment.get("rich_text", [])))
+            if not agents or self.notion.comment_author_is_bot(comment):
+                continue
+            for agent in agents:
+                if self.store.triggered(page["id"], comment["id"], agent):
                     continue
-                if datetime.fromisoformat(comment["created_time"].replace("Z", "+00:00")) < since:
+                if (reason := self.candidate(page, agent)) == WAITING:
+                    continue  # Retried after reconciliation; no notice on a waiting issue.
+                if reason:
+                    self.comment_problem(page, comment, agent, reason)
                     continue
-                agents = mentioned_agents(text_of(comment.get("rich_text", [])))
-                if not agents or self.notion.comment_author_is_bot(comment):
-                    continue
-                for agent in agents:
-                    if self.store.triggered(page["id"], comment["id"], agent):
-                        continue
-                    if reason := self.candidate(page, agent):
-                        self.comment_problem(page, comment, agent, reason)
-                        continue
-                    try:
-                        await self.accept(page, comment, agent, comments[:comments.index(comment) + 1], background=background)
-                    except ValueError as error:
-                        self.comment_problem(page, comment, agent, str(error))
-                    if self.store.triggered(page["id"], comment["id"], agent):
-                        return True
+                try:
+                    await self.accept(page, comment, agent, comments[:comments.index(comment) + 1], background=background)
+                except ValueError as error:
+                    self.comment_problem(page, comment, agent, str(error))
+                if self.store.triggered(page["id"], comment["id"], agent):
+                    return True
         return False
 
     def comment_problem(self, page, comment, agent, reason):

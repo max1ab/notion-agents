@@ -1,16 +1,21 @@
 import asyncio
 import copy
+import io
 import json
 import os
 import subprocess
 import tempfile
 import tomllib
 import unittest
+import urllib.error
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from notion_agent import cli
 from notion_agent.config import initial, load, save
-from notion_agent.notion import Notion, NotionError, CommentWriteUncertain, ExecutionWriteUncertain, rich, value
+from notion_agent.notion import (Notion, NotionError, NotionRequestRejected, CommentWriteUncertain,
+                                 ExecutionWriteUncertain, rich, value)
 from notion_agent.runners import command, execute, parse_events, child_environment
 from notion_agent.store import Store, instance_lock
 from notion_agent.worker import Worker, outcome, readable_answer, mentioned_agents, prompt_for
@@ -40,8 +45,15 @@ class FakeNotion:
         self.timing_writes = []
         self.execution_records = {}
         self.execution_writes = []
+        self.execution_creates = []
+        self.missing = set()
+        self.stats_down = False
 
     def sync_execution(self, source, run, persist):
+        if self.stats_down:
+            raise NotionError("Notion POST data_sources/records/query: HTTP 502")
+        if "execution_record" not in run:
+            self.execution_creates.append(run["id"])
         operation = run.setdefault("execution_record", {"source_id": source, "page_id": "record-" + run["id"]})
         persist()
         self.execution_records[run["id"]] = {"start": run["started_at"], "end": run.get("ended_at"),
@@ -53,6 +65,8 @@ class FakeNotion:
         return operation["page_id"]
 
     def update_timings(self, page_id, stats):
+        if self.stats_down:
+            raise NotionError(f"Notion PATCH pages/{page_id}: HTTP 502")
         self.timing_writes.append(copy.deepcopy(stats))
         if stats:
             for name, key in {"最近耗时（秒）": "latest_seconds", "累计耗时（秒）": "total_seconds", "执行次数": "execution_count"}.items():
@@ -61,6 +75,8 @@ class FakeNotion:
     def query(self, machine, project_ids=None, status="待办"):
         rows = []
         for card in (self.p, *self.extra_pages.values()):
+            if card["id"] in self.missing or card.get("in_trash"):
+                continue
             if project_ids is not None:
                 ids = [x["id"] for x in card.get("properties", {}).get("项目", {}).get("relation", [])]
                 if not set(ids).intersection(project_ids):
@@ -79,6 +95,8 @@ class FakeNotion:
         return self.extra_pages.get(page_id, self.p)
 
     def page(self, page_id):
+        if page_id in self.missing:
+            raise NotionError(f"Notion GET pages/{page_id}: HTTP 404")
         return copy.deepcopy(self.card(page_id))
 
     def body(self, _):
@@ -119,6 +137,40 @@ class FakeNotion:
         return key, thread
 
 
+class RemoteCommentNotion(FakeNotion):
+    """Runs the real comment reconciliation against an in-memory comments API."""
+    def __init__(self, p):
+        super().__init__(p)
+        self.remote = []
+        self.posts = []
+        self.reply_fault = None  # "lost": written, response lost; "vanished": also resolved before reconciling
+
+    def request(self, method, path, body=None):
+        if path == "users/me":
+            return {"id": "integration"}
+        if method == "GET":
+            page_id = path.split("block_id=")[1].split("&")[0]
+            return {"results": [c for c in self.remote if c["page"] == page_id], "has_more": False}
+        page_id = body.get("parent", {}).get("page_id") or next(
+            c["page"] for c in self.remote if c["discussion_id"] == body["discussion_id"])
+        self.posts.append((page_id, body))
+        comment = {"id": f"remote-{len(self.posts)}", "page": page_id,
+                   "discussion_id": body.get("discussion_id") or f"thread-{len(self.posts)}",
+                   "created_by": {"id": "integration"}, "rich_text": body["rich_text"],
+                   "display_name": {"resolved_name": body["display_name"]["custom"]["name"]}}
+        self.remote.append(comment)
+        fault = self.reply_fault if body.get("discussion_id") else None
+        if fault:
+            self.reply_fault = None
+            if fault == "vanished":
+                self.remote.remove(comment)
+            raise NotionError("Notion POST comments: 网络错误或响应不确定")
+        return comment
+
+    def post_comment(self, *args, **kwargs):
+        return Notion.post_comment(self, *args, **kwargs)
+
+
 class WorkerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -145,6 +197,18 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
 
     def worker(self):
         return Worker(self.config, self.notion, self.store, self.fake_runner)
+
+    def stats_due(self):
+        """Simulate the retry backoff elapsing."""
+        with self.store.db:
+            self.store.db.execute("UPDATE stats_outbox SET next_at=''")
+
+    def assert_delivery_pending(self, run_id=None):
+        run = self.store.get(run_id) if run_id else self.store.all()[-1]
+        self.assertEqual(run["phase"], "delivering")
+        self.assertTrue(run["delivery_error"])
+        self.assertGreaterEqual(run["delivery_attempts"], 1)
+        return run
 
     def incoming(self, text, id="human-1", bot=False, created=None):
         from notion_agent.worker import now
@@ -227,6 +291,192 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, 1)
         self.assertEqual(value(self.notion.card("page-2"), "状态"), "待办")
 
+    def restart(self):
+        self.store.db.close()
+        self.store = Store(self.config.state_dir)
+
+    async def test_statistics_outage_never_blocks_delivery_and_backfills_once(self):
+        self.config.execution_data_source_id = "records"
+        self.add_card("page-2", "demo")
+        self.notion.stats_down = True
+        worker = self.worker()
+        await worker.scan()
+        await worker.scan()
+        self.assertEqual(self.calls, 2)
+        for card in ("page-1", "page-2"):
+            self.assertEqual(value(self.notion.card(card), "状态"), "待我验收")
+        self.assertEqual(list(self.notion.comments.values()).count("结论：通过。"), 2)
+        self.assertFalse(self.store.all(active=True))
+        runs = [r["id"] for r in self.store.all()]
+        pending = self.store.pending_stats()
+        self.assertEqual({(i["channel"], i["key"]) for i in pending},
+                         {("execution", runs[0]), ("execution", runs[1]), ("timings", "page-1"), ("timings", "page-2")})
+        self.assertTrue(all("HTTP 502" in i["error"] and i["attempts"] >= 1 for i in pending))
+        self.restart()
+        self.stats_due()
+        await self.worker().scan()
+        self.assertEqual(self.calls, 2)
+        self.notion.stats_down = False
+        self.stats_due()
+        await self.worker().scan()
+        self.assertFalse(self.store.pending_stats())
+        self.assertEqual(sorted(self.notion.execution_creates), sorted(runs))
+        self.assertTrue(all(r["end"] and r["result"] == "待我验收" for r in self.notion.execution_records.values()))
+        for card in ("page-1", "page-2"):
+            self.assertEqual(self.notion.card(card)["properties"]["执行次数"]["number"], 1)
+        writes = len(self.notion.execution_writes)
+        await self.worker().scan()
+        self.assertEqual(len(self.notion.execution_writes), writes)
+        self.assertEqual(self.calls, 2)
+
+    async def test_statistics_queue_survives_upgrade_of_stuck_delivery(self):
+        self.store.put({"id": "legacy", "page_id": "page-1", "phase": "delivering"})
+        with self.store.db:
+            self.store.db.execute("DROP TABLE stats_outbox")
+        self.restart()
+        self.assertEqual([(i["channel"], i["key"]) for i in self.store.pending_stats()], [("execution", "legacy")])
+
+    async def lose_card_after_execution(self, lose):
+        self.add_card("page-2", "demo")
+        async def runner(config, run, store):
+            await self.fake_runner(config, run, store)
+            if run["page_id"] == "page-1":
+                lose()
+        worker = Worker(self.config, self.notion, self.store, runner)
+        await worker.scan()
+        lost = self.assert_delivery_pending()
+        await worker.scan()
+        self.assertEqual(self.calls, 2)
+        self.assertEqual(value(self.notion.card("page-2"), "状态"), "待我验收")
+        lost = self.assert_delivery_pending(lost["id"])
+        self.assertIn("结论：通过", lost["answer"])
+        self.assertEqual(lost["reply_chunks"], ["结论：通过。"])
+        self.assertEqual(lost["delivery_attempts"], 2)
+        return worker, lost
+
+    async def test_inaccessible_card_keeps_local_result_and_queue_moves_on(self):
+        worker, lost = await self.lose_card_after_execution(lambda: self.notion.missing.add("page-1"))
+        self.assertIn("HTTP 404", lost["delivery_error"])
+        self.notion.missing.discard("page-1")
+        await worker.scan()
+        self.assertEqual(self.calls, 2)
+        self.assertEqual(value(self.notion.p, "状态"), "待我验收")
+        self.assertNotIn("delivery_error", self.store.get(lost["id"]))
+
+    async def test_trashed_card_is_not_written_and_queue_moves_on(self):
+        worker, lost = await self.lose_card_after_execution(lambda: self.notion.p.update(in_trash=True))
+        self.assertIn("回收站", lost["delivery_error"])
+        # Only page-2 received a reply; the trashed card keeps its status untouched.
+        self.assertEqual(list(self.notion.comments.values()).count("结论：通过。"), 1)
+        self.assertEqual(value(self.notion.p, "状态"), "执行中")
+        self.notion.p["in_trash"] = False
+        await worker.scan()
+        self.assertEqual(value(self.notion.p, "状态"), "待我验收")
+
+    async def test_unreadable_card_does_not_stop_the_queue(self):
+        self.add_card("page-2", "demo")
+        original = self.notion.body
+        def body(page_id):
+            if page_id == "page-1":
+                raise NotionError("Notion GET blocks/page-1/children: HTTP 403")
+            return original(page_id)
+        self.notion.body = body
+        await self.worker().scan()
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(value(self.notion.p, "状态"), "待办")
+        self.assertEqual(value(self.notion.card("page-2"), "状态"), "待我验收")
+
+    async def test_lost_reply_response_reconciles_after_restart(self):
+        self.notion = RemoteCommentNotion(page())
+        self.notion.reply_fault = "lost"
+        await self.worker().scan()
+        run = self.assert_delivery_pending()
+        self.assertEqual(value(self.notion.p, "状态"), "执行中")
+        self.restart()
+        await self.worker().scan()
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(len(self.notion.posts), 2)
+        self.assertEqual(value(self.notion.p, "状态"), "待我验收")
+        self.assertEqual(self.store.get(run["id"])["comment_operations"]["reply-0"]["comment_id"], "remote-2")
+
+    async def test_uncertain_reply_is_never_resent_or_rerun(self):
+        self.notion = RemoteCommentNotion(page())
+        self.add_card("page-2", "demo")
+        self.notion.reply_fault = "vanished"
+        await self.worker().scan()
+        run = self.assert_delivery_pending()
+        for _ in range(2):
+            self.restart()
+            await self.worker().scan()
+        run = self.assert_delivery_pending(run["id"])
+        self.assertIn("CommentWriteUncertain", run["delivery_error"])
+        self.assertEqual(self.calls, 2)
+        self.assertEqual(sum(1 for page_id, body in self.notion.posts if page_id == "page-1" and body.get("discussion_id")), 1)
+        self.assertEqual(value(self.notion.p, "状态"), "执行中")
+        self.assertEqual(value(self.notion.card("page-2"), "状态"), "待我验收")
+
+    async def test_rerouted_card_waits_alone_without_overwriting_human_status(self):
+        self.config.agents["Claude Code"]["command"] = "/usr/bin/true"
+        self.add_card("page-2", "demo")
+        async def reroute(config, run, store):
+            await self.fake_runner(config, run, store)
+            if run["page_id"] == "page-1":
+                self.notion.p["properties"]["执行 Agent"]["select"]["name"] = "Claude Code"
+        worker = Worker(self.config, self.notion, self.store, reroute)
+        await worker.scan()
+        held = self.store.all()[0]
+        self.assertEqual(held["phase"], "hold")
+        self.notion.update("page-1", status="待办")
+        comment = self.incoming("@codex 继续")
+        await worker.scan()
+        await worker.scan()
+        self.assertEqual(self.calls, 2)
+        self.assertEqual(value(self.notion.card("page-2"), "状态"), "待我验收")
+        self.assertEqual(value(self.notion.p, "状态"), "待办")
+        self.assertEqual(value(self.notion.p, "最近运行 ID"), held["id"])
+        self.assertEqual(self.store.get(held["id"])["phase"], "hold")
+        self.assertFalse(self.store.triggered("page-1", comment["id"], "Codex"))
+        self.assertFalse(any("暂未接单" in text for text in self.notion.comments.values()))
+
+    async def test_surviving_process_of_finished_run_still_blocks_machine(self):
+        self.add_card("page-2", "demo")
+        async def lingering(config, run, store):
+            await self.fake_runner(config, run, store)
+            run["pid"] = os.getpid()  # A process outlived the CLI and may still write the directory.
+        await Worker(self.config, self.notion, self.store, lingering).scan()
+        self.assertEqual(self.store.latest("page-1")["phase"], "delivering")
+        await self.worker().scan()
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(value(self.notion.p, "状态"), "执行中")
+        self.assertNotIn("结论：通过。", self.notion.comments.values())
+        self.assertEqual(value(self.notion.card("page-2"), "状态"), "待办")
+        with patch("notion_agent.worker.process_alive", return_value=False):
+            await self.worker().scan()
+        self.assertEqual(self.calls, 2)
+        self.assertEqual(value(self.notion.p, "状态"), "待我验收")
+        self.assertEqual(value(self.notion.card("page-2"), "状态"), "待我验收")
+
+    async def test_ambiguous_claim_never_launches_and_only_holds_that_card(self):
+        self.add_card("page-2", "demo")
+        original = self.notion.update
+        def lost(page_id, **kwargs):
+            original(page_id, **kwargs)
+            if page_id == "page-1" and kwargs.get("status") == "执行中":
+                self.notion.update = original
+                raise NotionError("claim response lost")
+        self.notion.update = lost
+        worker = self.worker()
+        await worker.scan()
+        self.assertEqual(self.calls, 0)
+        self.assertEqual(self.store.all()[0]["phase"], "claimed")
+        await worker.scan()
+        self.assertEqual(self.calls, 1)
+        first = self.store.all()[0]
+        self.assertEqual(first["page_id"], "page-1")
+        self.assertIn("未自动重跑", first["error"])
+        self.assertEqual(value(self.notion.p, "状态"), "需处理")
+        self.assertEqual(value(self.notion.card("page-2"), "状态"), "待我验收")
+
     async def test_comment_resumes_codex_and_survives_store_restart(self):
         await self.worker().scan()
         original = self.store.all()[0]
@@ -247,16 +497,20 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.config.execution_data_source_id = "execution-source"
         self.notion.fail_execution_once = True
         worker = self.worker()
-        with self.assertRaises(NotionError):
-            await worker.scan()
+        await worker.scan()
         self.assertEqual(self.calls, 1)
         self.assertEqual(self.notion.execution_writes[0]["result"], "执行中")
         self.assertIsNone(self.notion.execution_writes[0]["end"])
         self.assertTrue(self.notion.execution_writes[-1]["end"])
+        # The lost record response neither blocks delivery nor is forgotten.
+        self.assertEqual(self.store.all()[0]["phase"], "complete")
+        self.assertEqual(value(self.notion.p, "状态"), "待我验收")
+        self.assertEqual([item["channel"] for item in self.store.pending_stats()], ["execution"])
+        self.stats_due()
         await worker.scan()
         self.assertEqual(self.calls, 1)
         self.assertEqual(len(self.notion.execution_records), 1)
-        self.assertEqual(self.store.all()[0]["phase"], "complete")
+        self.assertFalse(self.store.pending_stats())
         self.config.agents["Claude Code"]["command"] = "/usr/bin/true"
         self.incoming("@claude review")
         await worker.scan()
@@ -268,8 +522,8 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.config.execution_data_source_id = "original-source"
         self.notion.fail_delivery_once = True
         worker = self.worker()
-        with self.assertRaises(NotionError):
-            await worker.scan()
+        await worker.scan()
+        self.assert_delivery_pending()
         self.config.execution_data_source_id = "new-source"
         await worker.scan()
         self.assertEqual(self.store.all()[0]["execution_record"]["source_id"], "original-source")
@@ -368,9 +622,8 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.config.comments = False
         self.incoming("@claude review")
         self.notion.fail_delivery_once = True
-        with self.assertRaises(NotionError):
-            await self.worker().scan()
-        self.assertEqual(self.store.all()[-1]["phase"], "delivering")
+        await self.worker().scan()
+        self.assert_delivery_pending()
         await self.worker().scan()
         self.assertEqual(self.calls, 2)
         self.assertEqual(self.store.all()[-1]["phase"], "complete")
@@ -430,12 +683,15 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             raise NotionError("timing write response lost")
         self.notion.update_timings = ambiguous
         worker = self.worker()
-        with self.assertRaises(NotionError):
-            await worker.scan()
+        await worker.scan()
         first = copy.deepcopy(self.notion.timing_writes[-1])
-        self.assertEqual(self.store.all()[0]["phase"], "delivering")
+        self.assertEqual(self.store.all()[0]["phase"], "complete")
+        self.assertEqual(value(self.notion.p, "状态"), "待我验收")
+        self.assertEqual(self.store.pending_stats()[0]["channel"], "timings")
+        self.stats_due()
         await worker.scan()
         self.assertEqual(self.calls, 1)
+        self.assertFalse(self.store.pending_stats())
         self.assertEqual(self.notion.timing_writes[-1], first)
         self.assertEqual(first["execution_count"], 1)
         self.incoming("@codex 继续")
@@ -659,8 +915,8 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_lost_delivery_response_reconciles_without_rerunning(self):
         self.notion.fail_delivery_once = True
         worker = self.worker()
-        with self.assertRaises(NotionError):
-            await worker.scan()
+        await worker.scan()
+        self.assert_delivery_pending()
         self.assertEqual(self.calls, 1)
         self.assertEqual(value(self.notion.p, "状态"), "执行中")
         await worker.scan()
@@ -726,10 +982,13 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.store.all())
 
     async def test_ambiguous_spawning_blocks_restarts(self):
+        self.add_card("page-2", "demo")
         self.store.put({"id": "uncertain", "page_id": "page-1", "phase": "spawning"})
+        await self.worker().scan()
         await self.worker().scan()
         self.assertEqual(self.calls, 0)
         self.assertEqual(self.store.get("uncertain")["phase"], "hold")
+        self.assertEqual(value(self.notion.card("page-2"), "状态"), "待办")
 
     async def test_failure_requires_attention(self):
         async def fail(config, run, store):
@@ -754,17 +1013,18 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_recovery_not_reexecuted(self):
         worker = self.worker()
+        self.add_card("page-2", "demo")
         self.store.put({"id": "live", "page_id": "page-1", "phase": "running", "pid": os.getpid()})
         await worker.scan()
         self.assertEqual(self.calls, 0)
         self.assertEqual(self.store.get("live")["phase"], "running")
+        self.assertEqual(value(self.notion.card("page-2"), "状态"), "待办")
 
     async def test_completed_process_crash_recovery_delivers_attention(self):
         self.notion.fail_delivery_once = True
         worker = self.worker()
-        with self.assertRaises(NotionError):
-            await worker.scan()
-        run = self.store.all()[0]
+        await worker.scan()
+        run = self.assert_delivery_pending()
         run.update(phase="running", pid=99999999)
         self.store.put(run)
         await worker.scan()
@@ -836,8 +1096,8 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
                 raise NotionError("status response lost")
         self.notion.update = update
         worker = self.worker()
-        with self.assertRaises(NotionError):
-            await worker.scan()
+        await worker.scan()
+        self.assert_delivery_pending()
         await worker.scan()
         self.assertEqual(self.calls, 1)
         self.assertEqual(len(self.notion.blocks), 0)
@@ -870,6 +1130,58 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class UnitTests(unittest.TestCase):
+    def test_service_startup_ignores_execution_table_outage_but_doctor_reports_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            data = initial()
+            data["execution_data_source_id"] = "records"
+            save(data, path)
+            store = Store(Path(directory) / ".state")
+            self.addCleanup(store.db.close)
+            with (patch("notion_agent.cli.Notion", autospec=True) as notion_cls,
+                  patch("notion_agent.cli.Worker", autospec=True) as worker_cls,
+                  patch("notion_agent.cli.Store", return_value=store),
+                  patch.dict(os.environ, {"NOTION_TOKEN": "fake"})):
+                notion = notion_cls.return_value
+                notion.check_execution_schema.side_effect = NotionError("Execution table is unavailable")
+                cli.run(cli.parser().parse_args(["--config", str(path), "run"]))
+                worker_cls.return_value.serve.assert_awaited_once()
+                notion.check_schema.assert_called_once()
+                notion.check_execution_schema.assert_not_called()
+                with redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit) as failure:
+                    cli.run(cli.parser().parse_args(["--config", str(path), "doctor"]))
+                self.assertEqual(failure.exception.code, 1)
+                self.assertIn("Execution table is unavailable", output.getvalue())
+                notion.check_execution_schema.assert_called_once_with("records")
+
+    def test_execution_create_retries_after_http_rejection(self):
+        notion = Notion("fake", "tasks")
+        notion._execution_source_checked = "records"
+        run = {"id": "run-1", "page_id": "task-1", "agent": "Codex", "machine": "mac",
+               "started_at": "2026-11-19T01:00:00Z", "snapshot": {"title": "Task"}}
+        saved = []
+        creates = []
+
+        def urlopen(request, timeout):
+            if request.full_url.endswith("/query"):
+                return io.BytesIO(b'{"results": [], "has_more": false}')
+            if request.get_method() == "POST" and request.full_url.endswith("/pages"):
+                creates.append(request)
+                if len(creates) == 1:
+                    raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, None)
+                return io.BytesIO(b'{"id": "remote-record"}')
+            return io.BytesIO(b'{"id": "remote-record"}')  # Later sync updates the same row.
+
+        with patch("notion_agent.notion.urllib.request.urlopen", side_effect=urlopen), patch("notion_agent.notion.time.sleep"):
+            with self.assertRaises(NotionRequestRejected):
+                notion.sync_execution("records", run, lambda: saved.append(copy.deepcopy(run)))
+            self.assertTrue(saved[0]["execution_record"]["attempted"])
+            self.assertNotIn("attempted", saved[-1]["execution_record"])
+            run = saved[-1]  # Verify the database copy is also retryable after restart.
+            self.assertEqual(notion.sync_execution("records", run, lambda: None), "remote-record")
+            self.assertEqual(notion.sync_execution("records", run, lambda: None), "remote-record")
+        self.assertEqual(len(creates), 2)
+
     def test_execution_create_lost_response_reconciles_same_row(self):
         notion = Notion("fake", "tasks")
         notion._execution_source_checked = "records"

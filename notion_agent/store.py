@@ -46,6 +46,15 @@ class Store:
         self.db.execute("INSERT OR IGNORE INTO metadata VALUES ('comments_since', ?)",
                         (datetime.now(timezone.utc).isoformat(),))
         self.db.execute("CREATE TABLE IF NOT EXISTS comment_triggers (page_id TEXT, comment_id TEXT, agent TEXT, run_id TEXT, PRIMARY KEY(page_id, comment_id, agent))")
+        fresh = not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stats_outbox'").fetchone()
+        # Timeline rows and timing fields retry here, decoupled from task delivery.
+        self.db.execute("CREATE TABLE IF NOT EXISTS stats_outbox (channel TEXT, key TEXT, page_id TEXT, run_id TEXT, "
+                        "attempts INTEGER NOT NULL DEFAULT 0, next_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', "
+                        "PRIMARY KEY(channel, key))")
+        if fresh:
+            # Older versions synced timelines inside delivery; keep unfinished runs retriable.
+            self.db.execute("INSERT OR IGNORE INTO stats_outbox (channel, key, page_id, run_id) "
+                            "SELECT 'execution', id, page_id, id FROM runs WHERE phase != 'complete'")
         self.db.commit()
 
     @property
@@ -97,13 +106,32 @@ class Store:
             "SELECT value FROM metadata WHERE key LIKE ?", ("comment-problem:" + page_id + ":%",)))
         return {op["comment_id"] for op in operations if op.get("comment_id")}
 
-    def put(self, run):
+    def put(self, run, stats=()):
         with self.db:
             if run.get("trigger"):
                 self.db.execute("INSERT OR IGNORE INTO comment_triggers VALUES (?,?,?,?)",
                                 (run["page_id"], run["trigger"]["id"], run["agent"], run["id"]))
             self.db.execute("INSERT INTO runs VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET phase=excluded.phase, data=excluded.data",
                             (run["id"], run["page_id"], run["phase"], json.dumps(run, ensure_ascii=False)))
+            # Queue statistics in the same transaction as the run state they describe.
+            for channel, key in stats:
+                self.db.execute("INSERT INTO stats_outbox (channel, key, page_id, run_id) VALUES (?,?,?,?) "
+                                "ON CONFLICT(channel, key) DO UPDATE SET page_id=excluded.page_id, run_id=excluded.run_id, next_at=''",
+                                (channel, key, run["page_id"], run["id"]))
+
+    def pending_stats(self):
+        columns = ("channel", "key", "page_id", "run_id", "attempts", "next_at", "error")
+        return [dict(zip(columns, row)) for row in self.db.execute(
+            "SELECT " + ", ".join(columns) + " FROM stats_outbox ORDER BY rowid")]
+
+    def stats_failed(self, item, error, next_at):
+        with self.db:
+            self.db.execute("UPDATE stats_outbox SET attempts=attempts+1, error=?, next_at=? WHERE channel=? AND key=?",
+                            (error, next_at, item["channel"], item["key"]))
+
+    def stats_done(self, item):
+        with self.db:
+            self.db.execute("DELETE FROM stats_outbox WHERE channel=? AND key=?", (item["channel"], item["key"]))
 
     def get(self, run_id):
         row = self.db.execute("SELECT data FROM runs WHERE id=?", (run_id,)).fetchone()

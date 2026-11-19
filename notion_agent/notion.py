@@ -13,6 +13,10 @@ class NotionError(RuntimeError):
     pass
 
 
+class NotionRequestRejected(NotionError):
+    """Notion explicitly rejected the request before applying it."""
+
+
 class CommentWriteUncertain(NotionError):
     """An attempted comment cannot yet be reconciled; never append blindly."""
 
@@ -71,16 +75,20 @@ class Notion:
                 with urllib.request.urlopen(req, timeout=30) as response:
                     return json.load(response)
             except urllib.error.HTTPError as error:
-                if error.code == 429:
-                    time.sleep(min(float(error.headers.get("Retry-After", 2 ** attempt)), 60))
+                status = error.code
+                retry_after = error.headers.get("Retry-After") if error.headers else None
+                error.close()
+                if status == 429:
+                    time.sleep(min(float(retry_after or 2 ** attempt), 60))
                     continue
-                if method == "GET" and error.code >= 500 and attempt < 4:
+                if method == "GET" and status >= 500 and attempt < 4:
                     time.sleep(2 ** attempt)
                     continue
-                raise NotionError(f"Notion {method} {path}: HTTP {error.code}") from None
+                failure = NotionRequestRejected if status in (400, 401, 403, 404, 413, 422) else NotionError
+                raise failure(f"Notion {method} {path}: HTTP {status}") from None
             except (urllib.error.URLError, TimeoutError, OSError):
                 raise NotionError(f"Notion {method} {path}: 网络错误或响应不确定") from None
-        raise NotionError("Notion 限流，稍后重试")
+        raise NotionRequestRejected("Notion 限流，稍后重试")
 
     def source_schema(self):
         return self.request("GET", "data_sources/" + self.source)
@@ -233,8 +241,14 @@ class Notion:
             else:
                 operation["attempted"] = True
                 persist()
-                result = self.request("POST", "pages", {"parent": {"type": "data_source_id", "data_source_id": source_id},
-                                                        "properties": properties})
+                try:
+                    result = self.request("POST", "pages", {"parent": {"type": "data_source_id", "data_source_id": source_id},
+                                                            "properties": properties})
+                except NotionRequestRejected:
+                    # There was no remote mutation. The next retry can create after checking for a row.
+                    operation.pop("attempted")
+                    persist()
+                    raise
                 operation["page_id"] = result["id"]
                 persist()
                 return result["id"]
