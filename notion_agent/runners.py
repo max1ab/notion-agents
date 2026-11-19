@@ -33,7 +33,7 @@ def process_alive(run):
         return True
 
 
-def command(agent_name, settings, run_dir):
+def command(agent_name, settings, run_dir, session_id=None):
     args = list(settings.get("args", []))
     instructions_file = run_dir / "project-instructions.txt"
     instructions = instructions_file.read_text() if instructions_file.exists() else ""
@@ -44,10 +44,13 @@ def command(agent_name, settings, run_dir):
     if agent_name == "Codex":
         if instructions.strip():
             args.extend(["-c", "developer_instructions=" + json.dumps(instructions, ensure_ascii=False)])
-        return [settings["command"], "exec", *args, "--skip-git-repo-check", "--json", "-o", str(run_dir / "last-message.txt"), "-"]
+        # exec-level options (including --sandbox) precede the resume subcommand.
+        resume = ["resume", session_id] if session_id else []
+        return [settings["command"], "exec", *args, *resume, "--skip-git-repo-check", "--json", "-o", str(run_dir / "last-message.txt"), "-"]
     if instructions.strip():
         args.extend(["--append-system-prompt", instructions])
-    return [settings["command"], "--print", *args, "--output-format", "stream-json", "--verbose"]
+    resume = ["--resume", session_id] if session_id else []
+    return [settings["command"], "--print", *args, *resume, "--output-format", "stream-json", "--verbose"]
 
 
 def child_environment(config):
@@ -100,7 +103,7 @@ def parse_events(path, agent):
 async def execute(config, run, store):
     run_dir = Path(run["run_dir"])
     prompt = (run_dir / "prompt.txt").read_text()
-    argv = command(run["agent"], run["agent_settings"], run_dir)
+    argv = command(run["agent"], run["agent_settings"], run_dir, run.get("resume_session_id"))
     with (run_dir / "events.jsonl").open("w") as stdout, (run_dir / "stderr.log").open("w") as stderr:
         # Persist the uncertainty window before process creation. Recovery never starts it twice.
         run["phase"] = "spawning"

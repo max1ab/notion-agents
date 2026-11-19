@@ -12,7 +12,7 @@ from notion_agent.config import initial, load, save
 from notion_agent.notion import Notion, NotionError, CommentWriteUncertain, rich, value
 from notion_agent.runners import command, execute, parse_events, child_environment
 from notion_agent.store import Store, instance_lock
-from notion_agent.worker import Worker, outcome, readable_answer
+from notion_agent.worker import Worker, outcome, readable_answer, mentioned_agents, prompt_for
 from notion_agent.workspace import prepare
 
 
@@ -36,12 +36,18 @@ class FakeNotion:
         self.body_text = "请输出测试报告，验收：给出结论。"
         self.writes = []
 
-    def query(self, machine, project_ids=None):
+    def query(self, machine, project_ids=None, status="待办"):
         if project_ids is not None:
             ids = [x["id"] for x in self.p.get("properties", {}).get("项目", {}).get("relation", [])]
             if not set(ids).intersection(project_ids):
                 return []
-        return [copy.deepcopy(self.p)] if value(self.p, "状态") == "待办" else []
+        return [copy.deepcopy(self.p)] if status is None or value(self.p, "状态") == status else []
+
+    def list_comments(self, _):
+        return getattr(self, "incoming_comments", [])
+
+    def comment_author_is_bot(self, comment):
+        return comment.get("created_by", {}).get("type") == "bot"
 
     def page(self, _):
         return copy.deepcopy(self.p)
@@ -110,6 +116,234 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
 
     def worker(self):
         return Worker(self.config, self.notion, self.store, self.fake_runner)
+
+    def incoming(self, text, id="human-1", bot=False, created=None):
+        from notion_agent.worker import now
+        comment = {"id": id, "discussion_id": "human-thread", "created_time": created or now(),
+                   "created_by": {"id": "bot" if bot else "human", "type": "bot" if bot else "person"},
+                   "rich_text": rich(text)}
+        self.notion.incoming_comments = getattr(self.notion, "incoming_comments", []) + [comment]
+        return comment
+
+    async def test_comment_resumes_codex_and_survives_store_restart(self):
+        await self.worker().scan()
+        original = self.store.all()[0]
+        self.incoming("@codex 请按反馈继续")
+        self.store.db.close()
+        self.store = Store(self.config.state_dir)
+        await self.worker().scan()
+        run = self.store.all()[-1]
+        self.assertEqual(run["resume_session_id"], original["session_id"])
+        self.assertTrue(run["primary"])
+        self.assertEqual(run["discussion_id"], "human-thread")
+        self.assertIn("@codex 请按反馈继续", prompt_for(run))
+        await self.worker().scan()
+        self.assertEqual(self.calls, 2)
+        self.assertEqual(value(self.notion.p, "最近运行 ID"), run["id"])
+
+    async def test_auxiliary_claude_creation_resume_and_owner_return(self):
+        self.config.agents["Claude Code"]["command"] = "/usr/bin/true"
+        await self.worker().scan()
+        owner_id = value(self.notion.p, "最近运行 ID")
+        writes = len(self.notion.writes)
+        self.incoming("@claude review 当前改动")
+        await self.worker().scan()
+        auxiliary = self.store.all()[-1]
+        self.assertEqual(auxiliary["agent"], "Claude Code")
+        self.assertFalse(auxiliary["primary"])
+        self.assertIsNone(auxiliary["resume_session_id"])
+        self.assertEqual(value(self.notion.p, "最近运行 ID"), owner_id)
+        self.assertEqual(len(self.notion.writes), writes)
+        self.assertIn("结论：通过", auxiliary["context"])
+        self.incoming("@claude 再看一遍", "human-2")
+        await self.worker().scan()
+        self.assertEqual(self.store.all()[-1]["resume_session_id"], auxiliary["session_id"])
+        self.incoming("@codex 修正 review 发现", "human-3")
+        await self.worker().scan()
+        self.assertTrue(self.store.all()[-1]["primary"])
+        self.assertEqual(self.calls, 4)
+
+    async def test_draft_comment_can_start_with_empty_body(self):
+        self.notion.update("page-1", status="草稿")
+        self.notion.body_text = ""
+        self.incoming("@codex 请检查当前目录")
+        await self.worker().scan()
+        self.assertEqual(self.calls, 1)
+        self.assertTrue(self.store.all()[0]["primary"])
+        self.assertEqual(value(self.notion.p, "状态"), "待我验收")
+
+    async def test_comments_work_in_every_status(self):
+        for index, status in enumerate(("草稿", "待办", "执行中", "待我验收", "完成", "需处理")):
+            self.notion.update("page-1", status=status)
+            self.incoming("@codex 继续", f"human-{index}")
+            await self.worker().scan()
+        self.assertEqual(self.calls, 6)
+
+    async def test_bot_and_pre_activation_comments_never_trigger(self):
+        self.notion.update("page-1", status="草稿")
+        self.incoming("@codex 旧指令", created="2020-01-01T00:00:00Z")
+        self.incoming("@codex 自动回复", "bot-comment", bot=True)
+        await self.worker().scan()
+        self.assertEqual(self.calls, 0)
+        self.assertFalse(self.store.all())
+
+    async def test_person_attributed_service_reply_never_triggers_after_restart(self):
+        await self.worker().scan()
+        run = self.store.all()[0]
+        reply_id = run["comment_operations"]["reply-0"]["comment_id"]
+        self.incoming("用 @codex 继续", reply_id)
+        self.store.db.close()
+        self.store = Store(self.config.state_dir)
+        await self.worker().scan()
+        self.assertEqual(self.calls, 1)
+        # A genuine request by the same person still dispatches.
+        self.incoming("@codex 请继续", "real-human-request")
+        await self.worker().scan()
+        self.assertEqual(self.calls, 2)
+
+    async def test_person_attributed_problem_notice_never_triggers(self):
+        self.notion.update("page-1", status="草稿")
+        notice = self.incoming("@codex 请继续", "service-notice")
+        self.store.save_metadata("comment-problem:page-1:original:Codex:disabled",
+                                 {"comment_id": notice["id"]})
+        await self.worker().scan()
+        self.assertEqual(self.calls, 0)
+
+    async def test_multi_mentions_are_serial_and_deduplicated(self):
+        self.config.agents["Claude Code"]["command"] = "/usr/bin/true"
+        self.incoming("@codex @claude @CODEX 请分别检查")
+        await self.worker().scan()
+        await self.worker().scan()
+        await self.worker().scan()
+        self.assertEqual([r["agent"] for r in self.store.all()], ["Codex", "Claude Code"])
+        self.assertEqual(self.calls, 2)
+
+    async def test_auxiliary_response_loss_does_not_execute_twice(self):
+        self.config.agents["Claude Code"]["command"] = "/usr/bin/true"
+        await self.worker().scan()
+        self.config.comments = False
+        self.incoming("@claude review")
+        self.notion.fail_delivery_once = True
+        with self.assertRaises(NotionError):
+            await self.worker().scan()
+        self.assertEqual(self.store.all()[-1]["phase"], "delivering")
+        await self.worker().scan()
+        self.assertEqual(self.calls, 2)
+        self.assertEqual(self.store.all()[-1]["phase"], "complete")
+
+    async def test_missing_session_fails_closed_with_readable_notice(self):
+        await self.worker().scan()
+        run = self.store.all()[0]
+        run["session_id"] = None
+        self.store.put(run)
+        self.incoming("@codex 继续")
+        await self.worker().scan()
+        await self.worker().scan()
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(sum("会话 ID 缺失" in s for s in self.notion.comments.values()), 1)
+
+    async def test_disabled_agent_notice_retries_when_enabled(self):
+        self.config.agents["Claude Code"]["command"] = "/usr/bin/true"
+        self.config.agents["Claude Code"]["enabled"] = False
+        self.notion.update("page-1", status="草稿")
+        self.incoming("@claude 检查")
+        await self.worker().scan()
+        await self.worker().scan()
+        self.assertEqual(self.calls, 0)
+        self.assertEqual(len(self.notion.comments), 1)
+        self.config.agents["Claude Code"]["enabled"] = True
+        await self.worker().scan()
+        self.assertEqual(self.calls, 1)
+        self.assertTrue(self.store.all()[0]["primary"])
+
+    async def test_comment_dry_run_has_no_writes_or_execution(self):
+        self.incoming("@codex 检查")
+        await self.worker().scan(dry_run=True)
+        self.assertEqual(self.calls, 0)
+        self.assertFalse(self.store.all())
+        self.assertFalse(self.notion.writes)
+        self.assertFalse(self.notion.comments)
+
+    async def test_auxiliary_failure_preserves_issue_status(self):
+        self.config.agents["Claude Code"]["command"] = "/usr/bin/true"
+        await self.worker().scan()
+        before = copy.deepcopy(self.notion.p)
+        async def fail(config, run, store):
+            run.update(exit_code=1, protocol_success=False, answer="review 失败，请检查权限")
+        self.incoming("@claude review")
+        await Worker(self.config, self.notion, self.store, fail).scan()
+        self.assertEqual(self.notion.p, before)
+        self.assertIn("review 失败，请检查权限", self.notion.comments.values())
+
+    async def test_context_excludes_later_pending_comments(self):
+        self.incoming("@codex 第一个请求")
+        self.incoming("@codex 第二个请求", "human-2")
+        await self.worker().scan()
+        self.assertNotIn("第二个请求", prompt_for(self.store.all()[0]))
+
+    async def test_auxiliary_project_move_holds_without_status_write(self):
+        self.config.agents["Claude Code"]["command"] = "/usr/bin/true"
+        await self.worker().scan()
+        self.incoming("@claude review")
+        writes = len(self.notion.writes)
+        async def moved(config, run, store):
+            await self.fake_runner(config, run, store)
+            self.notion.p["properties"]["执行机器"]["select"]["name"] = "another-machine"
+        await Worker(self.config, self.notion, self.store, moved).scan()
+        self.assertEqual(self.store.all()[-1]["phase"], "hold")
+        self.assertEqual(len(self.notion.writes), writes)
+
+    async def test_foreign_run_never_resumes_or_reassigns(self):
+        self.notion.update("page-1", status="草稿", run_id="foreign")
+        self.incoming("@codex 继续")
+        writes = len(self.notion.writes)
+        await self.worker().scan()
+        self.assertEqual(self.calls, 0)
+        self.assertFalse(self.store.all())
+        self.assertEqual(len(self.notion.writes), writes)
+        self.assertTrue(any("不属于本机" in t for t in self.notion.comments.values()))
+
+    async def test_resume_subprocess_receives_exact_session_and_stdin(self):
+        script = self.root / "mock-resume"
+        script.write_text('#!/usr/bin/env python3\nimport json,sys\nassert "resume" in sys.argv\nassert sys.argv[sys.argv.index("resume")+1] == "original-session"\nassert "本次用户评论" in sys.stdin.read()\nprint(json.dumps({"type":"thread.started","thread_id":"original-session"}))\nprint(json.dumps({"type":"item.completed","item":{"type":"agent_message","text":"continued"}}))\nprint(json.dumps({"type":"turn.completed"}))\n')
+        script.chmod(0o700)
+        run_dir = self.root / "resume-run"
+        run_dir.mkdir()
+        (run_dir / "prompt.txt").write_text("本次用户评论：继续")
+        run = {"id": "resume", "page_id": "resume", "phase": "claimed", "agent": "Codex", "run_dir": str(run_dir),
+               "workspace": str(self.root), "agent_settings": {"command": str(script)}, "resume_session_id": "original-session"}
+        await execute(self.config, run, self.store)
+        self.assertEqual(run["exit_code"], 0)
+        self.assertEqual(run["session_id"], "original-session")
+        self.assertEqual(run["answer"], "continued")
+
+    async def test_comment_draft_without_agent_selection_uses_mention(self):
+        self.notion.update("page-1", status="草稿")
+        self.notion.p["properties"]["执行 Agent"]["select"] = None
+        self.incoming("@codex 请检查")
+        await self.worker().scan()
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(self.store.all()[0]["agent"], "Codex")
+
+    async def test_failed_resume_can_retry_original_session(self):
+        await self.worker().scan()
+        self.incoming("@codex 继续")
+        async def fail(config, run, store):
+            run.update(exit_code=1, protocol_success=False, session_id=None, answer="CLI 连接失败")
+        await Worker(self.config, self.notion, self.store, fail).scan()
+        self.incoming("@codex 再试", "human-2")
+        await self.worker().scan()
+        self.assertEqual(self.store.all()[-1]["resume_session_id"], "actual-session")
+        self.assertEqual(self.calls, 2)
+
+    async def test_issue_owner_does_not_change_via_dropdown(self):
+        await self.worker().scan()
+        self.config.agents["Claude Code"]["command"] = "/usr/bin/true"
+        self.notion.p["properties"]["执行 Agent"]["select"]["name"] = "Claude Code"
+        self.notion.update("page-1", status="待办")
+        await self.worker().scan()
+        self.assertEqual(self.calls, 1)
+        self.assertIn("主 Agent 是 Codex", value(self.notion.p, "运行摘要"))
 
     def relation_project(self):
         self.notion.project_property_type = "relation"
@@ -463,6 +697,39 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class UnitTests(unittest.TestCase):
+    def test_mentions_require_explicit_alias_and_deduplicate(self):
+        self.assertEqual(mentioned_agents("@Codex 修复；@CLAUDE CODE review，@claude 再看"), ["Codex", "Claude Code"])
+        self.assertEqual(mentioned_agents("a@codex.example @codextra @claude-bot @@codex"), [])
+        self.assertEqual(mentioned_agents("请@codex修复，@claude检查"), ["Codex", "Claude Code"])
+
+    def test_resume_commands_use_exact_session_without_last_or_fork(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            codex = command("Codex", {"command": "/codex", "args": ["--sandbox", "workspace-write"]}, root, "codex-original")
+            self.assertEqual(codex[:7], ["/codex", "exec", "--sandbox", "workspace-write", "resume", "codex-original", "--skip-git-repo-check"])
+            claude = command("Claude Code", {"command": "/claude"}, root, "claude-original")
+            self.assertEqual(claude[claude.index("--resume") + 1], "claude-original")
+            for argv in (codex, claude):
+                self.assertNotIn("--last", argv)
+                self.assertNotIn("--fork-session", argv)
+
+    def test_comment_list_paginates_and_bot_lookup_is_cached(self):
+        notion = Notion("fake", "source")
+        calls = []
+        def request(method, path, body=None):
+            calls.append(path)
+            if path.startswith("users/"):
+                return {"type": "bot"}
+            second = "start_cursor=" in path
+            return {"results": [{"id": "b" if second else "a", "created_time": "2026-01-01"}],
+                    "has_more": not second, "next_cursor": "next cursor" if not second else None}
+        notion.request = request
+        self.assertEqual([c["id"] for c in notion.list_comments("page")], ["a", "b"])
+        self.assertIn("start_cursor=next%20cursor", calls[-1])
+        for _ in range(2):
+            self.assertTrue(notion.comment_author_is_bot({"created_by": {"id": "robot"}}))
+        self.assertEqual(calls.count("users/robot"), 1)
+
     def test_existing_wal_database_migrates_without_losing_runs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -516,6 +783,29 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(notion.post_comment("page", "已完成，请验收。", operation, lambda: None), ("comment", "thread"))
         self.assertEqual(len(writes), 1)
         self.assertEqual(writes[0]["rich_text"], rich("已完成，请验收。"))
+
+    def test_personal_token_owner_reply_recovers_lost_response(self):
+        notion = Notion("fake", "source")
+        remote = []
+        writes = []
+        def request(method, path, body=None):
+            if path == "users/me":
+                return {"id": "api-bot", "bot": {"owner": {
+                    "type": "user", "user": {"id": "token-owner"}}}}
+            if method == "GET":
+                return {"results": remote, "has_more": False}
+            writes.append(body)
+            remote.append({"id": "reply", "discussion_id": "thread",
+                           "created_by": {"id": "token-owner"}, "rich_text": body["rich_text"],
+                           "display_name": {"resolved_name": "Codex"}})
+            raise NotionError("response lost")
+        notion.request = request
+        operation = {}
+        with self.assertRaises(NotionError):
+            notion.post_comment("page", "使用 @codex 继续", operation, lambda: None, display_name="Codex")
+        self.assertEqual(notion.post_comment("page", "使用 @codex 继续", operation, lambda: None,
+                                             display_name="Codex"), ("reply", "thread"))
+        self.assertEqual(len(writes), 1)
 
     def test_uncertain_comment_missing_from_list_is_not_duplicated(self):
         notion = Notion("fake", "source")

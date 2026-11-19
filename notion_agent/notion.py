@@ -109,7 +109,7 @@ class Notion:
         if changes:
             self.request("PATCH", "data_sources/" + self.source, {"properties": changes})
 
-    def query(self, machine_id, project_ids=None):
+    def query(self, machine_id, project_ids=None, status="待办"):
         if project_ids is not None and not project_ids:
             return []
         groups = [None] if project_ids is None else [project_ids[i:i + 90] for i in range(0, len(project_ids), 90)]
@@ -117,7 +117,10 @@ class Notion:
         for group in groups:
             routing = ({"property": "执行机器", "select": {"equals": machine_id}} if group is None else
                        {"or": [{"property": "项目", "relation": {"contains": id}} for id in group]})
-            body = {"filter": {"and": [{"property": "状态", "status": {"equals": "待办"}}, routing]}, "page_size": 100}
+            filters = [routing]
+            if status is not None:
+                filters.insert(0, {"property": "状态", "status": {"equals": status}})
+            body = {"filter": {"and": filters}, "page_size": 100}
             while True:
                 result = self.request("POST", f"data_sources/{self.source}/query", body)
                 rows.extend(result["results"])
@@ -159,6 +162,30 @@ class Notion:
 
     def page(self, page_id):
         return self.request("GET", "pages/" + page_id)
+
+    def list_comments(self, page_id):
+        comments = []
+        cursor = None
+        while True:
+            path = "comments?block_id=" + page_id + "&page_size=100"
+            if cursor:
+                path += "&start_cursor=" + urllib.parse.quote(cursor)
+            result = self.request("GET", path)
+            comments.extend(result["results"])
+            if not result.get("has_more"):
+                return sorted(comments, key=lambda c: (c.get("created_time", ""), c["id"]))
+            cursor = result["next_cursor"]
+
+    def comment_author_is_bot(self, comment):
+        actor = comment.get("created_by", {})
+        if actor.get("type"):
+            return actor["type"] == "bot"
+        if not hasattr(self, "_comment_authors"):
+            self._comment_authors = {}
+        actor_id = actor["id"]
+        if actor_id not in self._comment_authors:
+            self._comment_authors[actor_id] = self.request("GET", "users/" + actor_id)["type"]
+        return self._comment_authors[actor_id] == "bot"
 
     def children(self, block_id):
         cursor = None
@@ -253,9 +280,13 @@ class Notion:
                 break
             cursor = result["next_cursor"]
         if "baseline_ids" not in operation:
-            actor = self.request("GET", "users/me")["id"]
+            me = self.request("GET", "users/me")
+            owner = me.get("bot", {}).get("owner", {})
+            actors = [me["id"]]
+            if owner.get("type") == "user" and owner.get("user", {}).get("id"):
+                actors.append(owner["user"]["id"])
             operation.update(baseline_ids=[c["id"] for c in comments], message=message,
-                             discussion_id=discussion_id, actor_id=actor, display_name=display_name)
+                             discussion_id=discussion_id, actor_id=me["id"], actor_ids=actors, display_name=display_name)
             persist()
         elif (message != operation["message"] or discussion_id != operation["discussion_id"]
               or display_name != operation.get("display_name")):
@@ -263,7 +294,7 @@ class Notion:
         if operation.get("attempted"):
             matches = [c for c in comments if c["id"] not in operation["baseline_ids"]
                        and text_of(c.get("rich_text", [])) == message
-                       and c.get("created_by", {}).get("id") == operation["actor_id"]
+                       and c.get("created_by", {}).get("id") in operation.get("actor_ids", [operation["actor_id"]])
                        and (not display_name or c.get("display_name", {}).get("resolved_name") == display_name)
                        and (not discussion_id or c.get("discussion_id") == discussion_id)]
             if len(matches) != 1:

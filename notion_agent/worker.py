@@ -6,13 +6,14 @@ import hashlib
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import workspace
 from .config import load
-from .notion import value, project_key
+from .notion import value, project_key, text_of
 from .runners import execute, process_alive, parse_events
 
 log = logging.getLogger(__name__)
@@ -36,7 +37,7 @@ def fingerprint(snapshot):
 
 def prompt_for(run):
     task = run["snapshot"]
-    return f"""你正在执行由用户通过 Notion 明确派发给本机的任务。
+    prompt = f"""你正在执行由用户通过 Notion 明确派发给本机的任务。
 任务：{task['title']}
 Notion issue：https://www.notion.so/{run['page_id'].replace('-', '')}
 运行 ID：{run['id']}
@@ -57,6 +58,20 @@ Notion issue：https://www.notion.so/{run['page_id'].replace('-', '')}
 --- 用户的任务正文 ---
 {task['body']}
 """
+    if run.get("trigger"):
+        prompt += ("\n--- 评论续办 ---\n"
+                   + ("你是本 issue 的主 Agent，服务根据你的结果更新状态。\n" if run["primary"] else
+                      "你是附属 Agent，只完成本次评论要求并回复；服务不会用你的结果修改 issue 状态。\n")
+                   + "原正文和历史回复是上下文，不要重新执行已完成的步骤。本次执行以最新用户评论为准。\n"
+                   + "--- 相关历史（可能截断）---\n" + run.get("context", "")
+                   + "\n--- 本次用户评论 ---\n" + text_of(run["trigger"].get("rich_text", [])) + "\n")
+    return prompt
+
+
+def mentioned_agents(text):
+    aliases = {"codex": "Codex", "claude": "Claude Code", "claude code": "Claude Code"}
+    names = re.findall(r"(?<![A-Za-z0-9_@])@(codex|claude(?:[ \t]+code)?)(?![A-Za-z0-9_-])", text, re.I)
+    return list(dict.fromkeys(aliases[re.sub(r"[ \t]+", " ", n.lower())] for n in names))
 
 
 def outcome(answer):
@@ -95,12 +110,12 @@ class Worker:
         self.store = store
         self.runner = runner
 
-    def candidate(self, page):
+    def candidate(self, page, trigger_agent=None):
         c = self.config
         relation = page.get("properties", {}).get("项目", {}).get("type") == "relation"
-        if value(page, "状态") != "待办" or (not relation and value(page, "执行机器") != c.machine_id):
+        if (not trigger_agent and value(page, "状态") != "待办") or (not relation and value(page, "执行机器") != c.machine_id):
             return "不属于本机待办"
-        agent = value(page, "执行 Agent")
+        agent = trigger_agent or value(page, "执行 Agent")
         if agent not in c.agents or not c.agents[agent].get("enabled", True):
             return "Agent 未启用"
         if not os.access(c.agents[agent]["command"], os.X_OK):
@@ -121,11 +136,14 @@ class Worker:
             workspace.validate(project, kind)
         except ValueError as e:
             return str(e)
-        last = self.store.latest(page["id"])
-        if last and last["phase"] != "complete":
+        if any(r["phase"] != "complete" for r in self.store.history(page["id"])):
             return "存在未结束的本地运行"
+        last = self.store.latest_primary(page["id"])
         if value(page, "最近运行 ID") and (not last or last["id"] != value(page, "最近运行 ID")):
             return "最近运行 ID 不属于本机已结束运行；先对账，不能自动重跑"
+        history = self.store.history(page["id"])
+        if not trigger_agent and history and agent != history[0]["agent"]:
+            return "此 issue 的主 Agent 是 " + history[0]["agent"] + "；请在评论中 @ 其他 Agent"
         return ""
 
     def refresh_projects(self, sync=False):
@@ -143,8 +161,9 @@ class Worker:
                 self.notion.register(self.config.machine_id, list(self.config.projects))
 
     def route_matches(self, page, run):
+        route_agent = run.get("route_agent", run["agent"])
         if run["snapshot"].get("project_type") == "relation":
-            if project_key(page) != run["snapshot"]["project"] or value(page, "执行 Agent") != run["agent"]:
+            if project_key(page) != run["snapshot"]["project"] or value(page, "执行 Agent") != route_agent:
                 return False
             project = self.notion.page(run["snapshot"]["project"])
             if project.get("archived") or project.get("in_trash"):
@@ -154,7 +173,7 @@ class Worker:
                 return False
             return (value(project, "执行机器") == run["machine"]
                     and Path(directory).expanduser().resolve() == Path(run["project_settings"]["path"]).resolve())
-        return (value(page, "执行机器") == run["machine"] and value(page, "执行 Agent") == run["agent"]
+        return (value(page, "执行机器") == run["machine"] and value(page, "执行 Agent") == route_agent
                 and value(page, "项目") == run["snapshot"]["project"])
 
     def seal(self, run, error=None):
@@ -201,6 +220,13 @@ class Worker:
 
     def deliver(self, run):
         page = self.notion.page(run["page_id"])
+        if not run.get("primary", True):
+            if not self.route_matches(page, run):
+                run.update(phase="hold", error="附属 Agent 执行期间路由变化，请人工对账")
+                self.store.put(run)
+                return
+            self.deliver_conversation(run)
+            return
         remote_id = value(page, "最近运行 ID")
         if remote_id != run["id"] or not self.route_matches(page, run):
             run.update(phase="hold", error="Notion 运行 ID 或路由被修改，已暂停回写；人工核对后 resolve")
@@ -254,6 +280,13 @@ class Worker:
             _, discussion_id = self.conversation_message(run, f"reply-{index}", chunk, discussion_id)
             run["discussion_id"] = discussion_id
             self.store.put(run)
+        if not run.get("primary", True):
+            if not self.route_matches(self.notion.page(run["page_id"]), run):
+                run.update(phase="hold", error="附属 Agent 交付期间路由变化，请人工对账")
+            else:
+                run["phase"] = "complete"
+            self.store.put(run)
+            return
         page = self.notion.page(run["page_id"])
         if (value(page, "最近运行 ID") != run["id"] or not self.route_matches(page, run)
                 or value(page, "状态") not in ("执行中", run["target_status"])):
@@ -278,29 +311,44 @@ class Worker:
             return
         self.notion.update(page["id"], status="草稿", summary="未接单：" + reason)
 
-    async def accept(self, page):
+    async def accept(self, page, trigger=None, agent=None, comments=()):
         # Re-read full input immediately before local claim, no shell interpolation.
         self.refresh_projects()
         page = self.notion.page(page["id"])
-        reason = self.candidate(page)
+        def decline(reason):
+            if trigger:
+                self.comment_problem(page, trigger, agent, reason)
+            else:
+                self.reject(page, reason)
+        reason = self.candidate(page, agent)
         if reason:
-            self.reject(page, reason)
+            decline(reason)
             return
         try:
             body = self.notion.body(page["id"])
         except ValueError as error:
-            self.reject(page, str(error))
+            decline(str(error))
             return
-        if not body.strip():
+        if not body.strip() and not trigger:
             self.reject(page, "任务正文不能为空")
             return
         snapshot = task_snapshot(page, body)
+        history = self.store.history(page["id"])
+        owner = history[0]["agent"] if history else (agent or snapshot["agent"])
+        primary = not trigger or agent == owner
+        previous = next((r for r in reversed(history) if r["agent"] == agent), None) if trigger else None
+        if previous and (previous["snapshot"]["project"] != snapshot["project"]
+                         or Path(previous["project_settings"]["path"]).resolve() != Path(self.config.projects[snapshot["project"]]["path"]).resolve()):
+            raise ValueError("评论续办的项目或目录已变化；请先人工核对原会话")
+        previous_session = (previous.get("session_id") or previous.get("resume_session_id")) if previous else None
+        if previous and not previous_session:
+            raise ValueError("原 Agent 会话 ID 缺失，不能保证继续同一会话；请人工核对")
         guide = ""
         if self.config.agent_guide_page_id:
             try:
                 guide = self.notion.body(self.config.agent_guide_page_id)
             except ValueError as error:
-                self.reject(page, "Agent 使用说明读取失败：" + str(error))
+                decline("Agent 使用说明读取失败：" + str(error))
                 return
         project = copy.deepcopy(self.config.projects[snapshot["project"]])
         project_page_id = project.get("notion_page_id")
@@ -310,7 +358,7 @@ class Worker:
                 if len(instructions.encode("utf-8")) > 64000:
                     raise ValueError("项目指令正文超过 64000 字节，请缩短")
             except ValueError as error:
-                self.reject(page, "项目指令读取失败：" + str(error))
+                decline("项目指令读取失败：" + str(error))
                 return
             current_project = self.notion.page(project_page_id)
             if current_project.get("last_edited_time") != project.get("notion_last_edited_time"):
@@ -318,7 +366,7 @@ class Worker:
                 return
             project["instructions"] = instructions
         if len((guide + project.get("instructions", "")).encode("utf-8")) > 64000:
-            self.reject(page, "使用说明与项目指令合计超过 64000 字节")
+            decline("使用说明与项目指令合计超过 64000 字节")
             return
         check = self.notion.page(page["id"])
         if fingerprint(task_snapshot(check, body)) != fingerprint(snapshot) or check.get("last_edited_time") != page.get("last_edited_time"):
@@ -329,23 +377,31 @@ class Worker:
         run_dir.mkdir(parents=True, mode=0o700)
         run = {"id": run_id, "page_id": page["id"], "phase": "claimed", "snapshot": snapshot,
                "snapshot_hash": fingerprint(snapshot), "machine": self.config.machine_id,
-               "agent": snapshot["agent"], "agent_settings": self.config.agents[snapshot["agent"]],
+               "agent": agent or snapshot["agent"], "agent_settings": self.config.agents[agent or snapshot["agent"]],
                "project_settings": project,
                "run_dir": str(run_dir), "started_at": now(), "delivery_format": "conversation",
                "workspace_guide": {"page_id": self.config.agent_guide_page_id, "content": guide}}
+        run["primary"] = primary
+        if trigger:
+            run.update(trigger=trigger, agent=agent, agent_settings=self.config.agents[agent],
+                       route_agent=snapshot["agent"], discussion_id=trigger.get("discussion_id"),
+                       resume_session_id=previous_session,
+                       context="\n\n".join(f"{r['agent']}：{readable_answer(r.get('answer', ''))}" for r in history)[-48000:]
+                       + "\n\n可见评论：\n" + "\n".join(text_of(c.get("rich_text", [])) for c in comments)[-24000:])
         self.store.put(run)
         (run_dir / "snapshot.json").write_text(json.dumps(run, ensure_ascii=False, indent=2))
         # Ambiguous claim response leaves a durable claimed record; recovery will reconcile, not launch.
-        self.notion.update(page["id"], status="执行中", run_id=run_id,
-                           summary=f"{run['agent']} 正在处理这个任务。")
+        if primary:
+            self.notion.update(page["id"], status="执行中", run_id=run_id,
+                               summary=f"{run['agent']} 正在处理这个任务。")
         check = self.notion.page(page["id"])
-        if value(check, "最近运行 ID") != run_id or value(check, "状态") != "执行中" or not self.route_matches(check, run):
+        if (primary and (value(check, "最近运行 ID") != run_id or value(check, "状态") != "执行中")) or not self.route_matches(check, run):
             self.seal(run, "启动前路由或状态变化，未启动 Agent")
             self.deliver(run)
             return
         try:
             if self.config.comments:
-                _, run["discussion_id"] = self.conversation_message(run, "claim", f"{run['agent']} 开始处理这个任务。")
+                _, run["discussion_id"] = self.conversation_message(run, "claim", f"{run['agent']} 开始处理这个任务。", run.get("discussion_id"))
                 self.store.put(run)
             run.update(workspace.prepare(run["project_settings"], snapshot["kind"], run_dir, run_id))
             (run_dir / "project-instructions.txt").write_text(project.get("instructions", ""))
@@ -369,6 +425,8 @@ class Worker:
                 log.warning("未完成运行尚未对账，本轮不接新任务")
                 return []
         self.refresh_projects(sync=not dry_run)
+        if not dry_run and await self.scan_comments():
+            return []
         if getattr(self.notion, "project_property_type", None) == "relation":
             rows = self.notion.query(self.config.machine_id, project_ids=list(self.config.projects))
         else:
@@ -392,6 +450,49 @@ class Worker:
             # Single task per scan; poll picks up freshly edited priorities/configuration.
             break
         return result
+
+    async def scan_comments(self):
+        """Poll all local issues, regardless of status; durable triggers prevent replay."""
+        if getattr(self.notion, "project_property_type", None) == "relation":
+            rows = self.notion.query(self.config.machine_id, project_ids=list(self.config.projects), status=None)
+        else:
+            rows = self.notion.query(self.config.machine_id, status=None)
+        since = datetime.fromisoformat(self.store.comments_since)
+        for page in rows:
+            if page.get("archived") or page.get("in_trash"):
+                continue
+            comments = self.notion.list_comments(page["id"])
+            sent_ids = self.store.sent_comment_ids(page["id"])
+            for comment in comments:
+                # Personal API tokens can attribute our replies to a person.
+                # Receipts distinguish them from that same person's real requests.
+                if comment["id"] in sent_ids:
+                    continue
+                if datetime.fromisoformat(comment["created_time"].replace("Z", "+00:00")) < since:
+                    continue
+                agents = mentioned_agents(text_of(comment.get("rich_text", [])))
+                if not agents or self.notion.comment_author_is_bot(comment):
+                    continue
+                for agent in agents:
+                    if self.store.triggered(page["id"], comment["id"], agent):
+                        continue
+                    if reason := self.candidate(page, agent):
+                        self.comment_problem(page, comment, agent, reason)
+                        continue
+                    try:
+                        await self.accept(page, comment, agent, comments[:comments.index(comment) + 1])
+                    except ValueError as error:
+                        self.comment_problem(page, comment, agent, str(error))
+                    if self.store.triggered(page["id"], comment["id"], agent):
+                        return True
+        return False
+
+    def comment_problem(self, page, comment, agent, reason):
+        key = "comment-problem:" + page["id"] + ":" + comment["id"] + ":" + agent + ":" + reason
+        operation = self.store.metadata(key) or {}
+        self.notion.post_comment(page["id"], f"{agent} 暂未接单：{reason}。修正后会自动重试。", operation,
+                                 lambda: self.store.save_metadata(key, operation), comment.get("discussion_id"),
+                                 display_name="调度程序")
 
     async def serve(self):
         log.info("服务启动：机器 %s，每 %s 秒扫描一次", self.config.machine_id, self.config.poll_seconds)

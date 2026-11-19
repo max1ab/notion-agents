@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sqlite3
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -40,10 +41,47 @@ class Store:
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, page_id TEXT, phase TEXT, data TEXT)")
         self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS active_page ON runs(page_id) WHERE phase != 'complete'")
+        self.db.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+        self.db.execute("INSERT OR IGNORE INTO metadata VALUES ('comments_since', ?)",
+                        (datetime.now(timezone.utc).isoformat(),))
+        self.db.execute("CREATE TABLE IF NOT EXISTS comment_triggers (page_id TEXT, comment_id TEXT, agent TEXT, run_id TEXT, PRIMARY KEY(page_id, comment_id, agent))")
         self.db.commit()
+
+    @property
+    def comments_since(self):
+        return self.db.execute("SELECT value FROM metadata WHERE key='comments_since'").fetchone()[0]
+
+    def metadata(self, key):
+        row = self.db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def save_metadata(self, key, data):
+        with self.db:
+            self.db.execute("INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            (key, json.dumps(data, ensure_ascii=False)))
+
+    def triggered(self, page_id, comment_id, agent):
+        return self.db.execute("SELECT 1 FROM comment_triggers WHERE page_id=? AND comment_id=? AND agent=?",
+                               (page_id, comment_id, agent)).fetchone() is not None
+
+    def history(self, page_id):
+        return [json.loads(row[0]) for row in self.db.execute("SELECT data FROM runs WHERE page_id=? ORDER BY rowid", (page_id,))]
+
+    def latest_primary(self, page_id):
+        return next((r for r in reversed(self.history(page_id)) if r.get("primary", True)), None)
+
+    def sent_comment_ids(self, page_id):
+        operations = [op for run in self.history(page_id)
+                      for op in run.get("comment_operations", {}).values()]
+        operations.extend(json.loads(row[0]) for row in self.db.execute(
+            "SELECT value FROM metadata WHERE key LIKE ?", ("comment-problem:" + page_id + ":%",)))
+        return {op["comment_id"] for op in operations if op.get("comment_id")}
 
     def put(self, run):
         with self.db:
+            if run.get("trigger"):
+                self.db.execute("INSERT OR IGNORE INTO comment_triggers VALUES (?,?,?,?)",
+                                (run["page_id"], run["trigger"]["id"], run["agent"], run["id"]))
             self.db.execute("INSERT INTO runs VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET phase=excluded.phase, data=excluded.data",
                             (run["id"], run["page_id"], run["phase"], json.dumps(run, ensure_ascii=False)))
 
