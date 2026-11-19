@@ -5,6 +5,8 @@ data_source_id = "00000000-0000-0000-0000-000000000000"
 projects_data_source_id = ""
 # 可选：工作区 Agent.md 页面 ID，新任务读取为协作说明。
 agent_guide_page_id = ""
+# 可选：执行记录表的数据源 ID，每次派单或评论续聊记录一行。
+execution_data_source_id = ""
 state_dir = ".state"
 poll_seconds = 30
 timeout_seconds = 3600

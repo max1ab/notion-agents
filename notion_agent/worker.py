@@ -13,7 +13,7 @@ from pathlib import Path
 
 from . import workspace
 from .config import load
-from .notion import value, project_key, text_of
+from .notion import value, project_key, text_of, NotionError
 from .runners import execute, process_alive, parse_events
 
 log = logging.getLogger(__name__)
@@ -183,7 +183,7 @@ class Worker:
         run["verdict"] = verdict
         run["target_status"] = ("待我验收" if run.get("exit_code") == 0 and run.get("protocol_success")
             and not run.get("error") and verdict["task_outcome"] == "ready_for_review" else "需处理")
-        run["ended_at"] = now()
+        run.setdefault("ended_at", now())
         report = (f"运行：{run['id']}\n机器：{run['machine']}\nAgent：{run['agent']}\n"
                   f"会话：{run.get('session_id', '未知')}\n工作目录：{run.get('workspace', '未创建')}\n"
                   f"开始：{run['started_at']}\n结束：{run['ended_at']}\n退出码：{run.get('exit_code')}\n"
@@ -219,6 +219,8 @@ class Worker:
                 self.deliver(run)
 
     def deliver(self, run):
+        # This row describes the immutable run, even if the issue was rerouted.
+        self.sync_execution(run)
         page = self.notion.page(run["page_id"])
         if not run.get("primary", True):
             if not self.route_matches(page, run):
@@ -259,6 +261,7 @@ class Worker:
             self.store.put(run)
             return
         summary = "已完成，等你验收。" if run["target_status"] == "待我验收" else "任务需要你处理，请查看回复。"
+        self.notion.update_timings(run["page_id"], self.store.timing_stats(run["page_id"]))
         self.notion.update(run["page_id"], status=run["target_status"], summary=summary)
         run["phase"] = "complete"
         self.store.put(run)
@@ -269,6 +272,11 @@ class Worker:
         return self.notion.post_comment(run["page_id"], message, operation,
                                        lambda: self.store.put(run), discussion_id,
                                        display_name="调度程序" if key == "claim" else run["agent"])
+
+    def sync_execution(self, run):
+        source = run.get("execution_data_source_id", self.config.execution_data_source_id)
+        if source:
+            self.notion.sync_execution(source, run, lambda: self.store.put(run))
 
     def deliver_conversation(self, run):
         discussion_id = run.get("discussion_id")
@@ -284,6 +292,7 @@ class Worker:
             if not self.route_matches(self.notion.page(run["page_id"]), run):
                 run.update(phase="hold", error="附属 Agent 交付期间路由变化，请人工对账")
             else:
+                self.notion.update_timings(run["page_id"], self.store.timing_stats(run["page_id"]))
                 run["phase"] = "complete"
             self.store.put(run)
             return
@@ -294,6 +303,7 @@ class Worker:
             self.store.put(run)
             return
         summary = "已完成，等你验收。" if run["target_status"] == "待我验收" else "任务需要你处理，请查看回复。"
+        self.notion.update_timings(run["page_id"], self.store.timing_stats(run["page_id"]))
         self.notion.update(run["page_id"], status=run["target_status"], summary=summary)
         run["phase"] = "complete"
         self.store.put(run)
@@ -381,6 +391,7 @@ class Worker:
                "project_settings": project,
                "run_dir": str(run_dir), "started_at": now(), "delivery_format": "conversation",
                "workspace_guide": {"page_id": self.config.agent_guide_page_id, "content": guide}}
+        run["execution_data_source_id"] = self.config.execution_data_source_id
         run["primary"] = primary
         if trigger:
             run.update(trigger=trigger, agent=agent, agent_settings=self.config.agents[agent],
@@ -400,6 +411,10 @@ class Worker:
             self.deliver(run)
             return
         try:
+            try:
+                self.sync_execution(run)
+            except NotionError as error:
+                log.warning("开始时间记录暂未确认，结束后重试：%s", error)
             if self.config.comments:
                 _, run["discussion_id"] = self.conversation_message(run, "claim", f"{run['agent']} 开始处理这个任务。", run.get("discussion_id"))
                 self.store.put(run)

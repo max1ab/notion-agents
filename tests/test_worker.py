@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from notion_agent.config import initial, load, save
-from notion_agent.notion import Notion, NotionError, CommentWriteUncertain, rich, value
+from notion_agent.notion import Notion, NotionError, CommentWriteUncertain, ExecutionWriteUncertain, rich, value
 from notion_agent.runners import command, execute, parse_events, child_environment
 from notion_agent.store import Store, instance_lock
 from notion_agent.worker import Worker, outcome, readable_answer, mentioned_agents, prompt_for
@@ -35,6 +35,26 @@ class FakeNotion:
         self.fail_delivery_once = False
         self.body_text = "请输出测试报告，验收：给出结论。"
         self.writes = []
+        self.timing_writes = []
+        self.execution_records = {}
+        self.execution_writes = []
+
+    def sync_execution(self, source, run, persist):
+        operation = run.setdefault("execution_record", {"source_id": source, "page_id": "record-" + run["id"]})
+        persist()
+        self.execution_records[run["id"]] = {"start": run["started_at"], "end": run.get("ended_at"),
+                                             "result": run.get("target_status", "执行中"), "page_id": operation["page_id"]}
+        self.execution_writes.append(copy.deepcopy(self.execution_records[run["id"]]))
+        if getattr(self, "fail_execution_once", False) and run.get("ended_at"):
+            self.fail_execution_once = False
+            raise NotionError("record update response lost")
+        return operation["page_id"]
+
+    def update_timings(self, page_id, stats):
+        self.timing_writes.append(copy.deepcopy(stats))
+        if stats:
+            for name, key in {"最近耗时（秒）": "latest_seconds", "累计耗时（秒）": "total_seconds", "执行次数": "execution_count"}.items():
+                self.p["properties"][name] = {"type": "number", "number": stats[key]}
 
     def query(self, machine, project_ids=None, status="待办"):
         if project_ids is not None:
@@ -140,6 +160,48 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         await self.worker().scan()
         self.assertEqual(self.calls, 2)
         self.assertEqual(value(self.notion.p, "最近运行 ID"), run["id"])
+
+    async def test_execution_record_start_finish_resume_and_lost_response(self):
+        self.config.execution_data_source_id = "execution-source"
+        self.notion.fail_execution_once = True
+        worker = self.worker()
+        with self.assertRaises(NotionError):
+            await worker.scan()
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(self.notion.execution_writes[0]["result"], "执行中")
+        self.assertIsNone(self.notion.execution_writes[0]["end"])
+        self.assertTrue(self.notion.execution_writes[-1]["end"])
+        await worker.scan()
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(len(self.notion.execution_records), 1)
+        self.assertEqual(self.store.all()[0]["phase"], "complete")
+        self.config.agents["Claude Code"]["command"] = "/usr/bin/true"
+        self.incoming("@claude review")
+        await worker.scan()
+        self.assertEqual(len(self.notion.execution_records), 2)
+        self.assertTrue(all(record["end"] for record in self.notion.execution_records.values()))
+        self.assertFalse(self.store.all()[-1]["primary"])
+
+    async def test_execution_source_is_bound_to_run_before_config_changes(self):
+        self.config.execution_data_source_id = "original-source"
+        self.notion.fail_delivery_once = True
+        worker = self.worker()
+        with self.assertRaises(NotionError):
+            await worker.scan()
+        self.config.execution_data_source_id = "new-source"
+        await worker.scan()
+        self.assertEqual(self.store.all()[0]["execution_record"]["source_id"], "original-source")
+
+    async def test_finished_execution_record_is_closed_when_task_routing_changes(self):
+        self.config.execution_data_source_id = "records"
+        async def reroute(config, run, store):
+            await self.fake_runner(config, run, store)
+            self.notion.p["properties"]["执行机器"]["select"]["name"] = "other-machine"
+        await Worker(self.config, self.notion, self.store, reroute).scan()
+        run = self.store.all()[0]
+        self.assertEqual(run["phase"], "hold")
+        self.assertTrue(self.notion.execution_records[run["id"]]["end"])
+        self.assertEqual(value(self.notion.p, "执行机器"), "other-machine")
 
     async def test_auxiliary_claude_creation_resume_and_owner_return(self):
         self.config.agents["Claude Code"]["command"] = "/usr/bin/true"
@@ -272,8 +334,37 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             run.update(exit_code=1, protocol_success=False, answer="review 失败，请检查权限")
         self.incoming("@claude review")
         await Worker(self.config, self.notion, self.store, fail).scan()
+        for name in ("最近耗时（秒）", "累计耗时（秒）", "执行次数"):
+            before["properties"][name] = self.notion.p["properties"][name]
         self.assertEqual(self.notion.p, before)
+        self.assertEqual(self.notion.p["properties"]["执行次数"]["number"], 2)
         self.assertIn("review 失败，请检查权限", self.notion.comments.values())
+
+    async def test_timing_write_response_loss_does_not_double_count_or_rerun(self):
+        original = self.notion.update_timings
+        def ambiguous(page_id, stats):
+            original(page_id, stats)
+            self.notion.update_timings = original
+            raise NotionError("timing write response lost")
+        self.notion.update_timings = ambiguous
+        worker = self.worker()
+        with self.assertRaises(NotionError):
+            await worker.scan()
+        first = copy.deepcopy(self.notion.timing_writes[-1])
+        self.assertEqual(self.store.all()[0]["phase"], "delivering")
+        await worker.scan()
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(self.notion.timing_writes[-1], first)
+        self.assertEqual(first["execution_count"], 1)
+        self.incoming("@codex 继续")
+        await worker.scan()
+        self.assertEqual(self.notion.timing_writes[-1]["execution_count"], 2)
+
+    async def test_draft_rejection_has_no_execution_timing(self):
+        self.notion.body_text = ""
+        await self.worker().scan()
+        self.assertEqual(value(self.notion.p, "状态"), "草稿")
+        self.assertFalse(self.notion.timing_writes)
 
     async def test_context_excludes_later_pending_comments(self):
         self.incoming("@codex 第一个请求")
@@ -697,6 +788,86 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class UnitTests(unittest.TestCase):
+    def test_execution_create_lost_response_reconciles_same_row(self):
+        notion = Notion("fake", "tasks")
+        notion._execution_source_checked = "records"
+        run = {"id": "run-1", "page_id": "task-1", "agent": "Codex", "machine": "mac",
+               "started_at": "2026-11-19T01:00:00Z", "snapshot": {"title": "Task"}}
+        rows = []
+        creates = []
+        patches = []
+        saved = []
+        def request(method, path, body=None):
+            if path.endswith("/query"):
+                return {"results": rows, "has_more": False}
+            if method == "POST" and path == "pages":
+                creates.append(body)
+                rows.append({"id": "remote-record", "properties": body["properties"]})
+                raise NotionError("create response lost")
+            if method == "PATCH":
+                patches.append(body)
+                return {"id": "remote-record"}
+            raise AssertionError((method, path))
+        notion.request = request
+        persist = lambda: saved.append(copy.deepcopy(run))
+        with self.assertRaises(NotionError):
+            notion.sync_execution("records", run, persist)
+        self.assertTrue(saved[-1]["execution_record"]["attempted"])
+        run.update(ended_at="2026-11-19T01:00:30Z", target_status="待我验收", trigger={"id": "comment"})
+        self.assertEqual(notion.sync_execution("records", run, persist), "remote-record")
+        self.assertEqual(len(creates), 1)
+        props = patches[-1]["properties"]
+        self.assertEqual(props["执行时间"]["date"]["end"], run["ended_at"])
+        self.assertEqual(props["结束时间（原始）"]["rich_text"][0]["text"]["content"], run["ended_at"])
+        self.assertEqual(props["耗时（秒）"]["number"], 30)
+        self.assertEqual(props["触发方式"]["select"]["name"], "评论续聊")
+        self.assertNotIn("耗时（分钟）", props)
+
+    def test_uncertain_or_duplicate_execution_records_are_not_recreated(self):
+        notion = Notion("fake", "tasks")
+        notion._execution_source_checked = "records"
+        run = {"id": "run-1", "page_id": "task-1", "agent": "Codex", "machine": "mac",
+               "started_at": "2026-11-19T01:00:00Z", "snapshot": {"title": "Task"},
+               "execution_record": {"source_id": "records", "attempted": True}}
+        calls = []
+        def request(method, path, body=None):
+            calls.append(path)
+            return {"results": [], "has_more": False}
+        notion.request = request
+        with self.assertRaises(ExecutionWriteUncertain):
+            notion.sync_execution("records", run, lambda: None)
+        self.assertNotIn("pages", calls)
+        notion.request = lambda *args: {"results": [{"id": "one"}, {"id": "two"}]}
+        with self.assertRaises(ExecutionWriteUncertain):
+            notion.sync_execution("records", run, lambda: None)
+
+    def test_timing_stats_include_failed_and_auxiliary_runs_but_not_unfinished(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory))
+            try:
+                self.assertIsNone(store.timing_stats("page"))
+                base = {"page_id": "page", "phase": "complete", "started_at": "2026-11-19T01:00:00Z"}
+                store.put({**base, "id": "success", "ended_at": "2026-11-19T01:00:10Z"})
+                store.put({**base, "id": "failed", "primary": False, "exit_code": 1, "ended_at": "2026-11-19T01:00:25Z"})
+                store.put({**base, "id": "unfinished"})
+                store.put({**base, "id": "bad-clock", "ended_at": "2026-11-18T01:00:00Z"})
+                self.assertEqual(store.timing_stats("page"), {"latest_seconds": 25.0, "total_seconds": 35.0, "execution_count": 2})
+                self.assertIsNone(store.timing_stats("different-page"))
+            finally:
+                store.db.close()
+
+    def test_timing_api_updates_only_numeric_fields_and_is_optional(self):
+        notion = Notion("fake", "source")
+        calls = []
+        notion.request = lambda *args: calls.append(args)
+        stats = {"latest_seconds": 2.5, "total_seconds": 10, "execution_count": 3}
+        notion.update_timings("page", stats)
+        self.assertFalse(calls)
+        notion.timing_enabled = True
+        notion.update_timings("page", stats)
+        self.assertEqual(calls, [("PATCH", "pages/page", {"properties": {
+            "最近耗时（秒）": {"number": 2.5}, "累计耗时（秒）": {"number": 10}, "执行次数": {"number": 3}}})])
+
     def test_mentions_require_explicit_alias_and_deduplicate(self):
         self.assertEqual(mentioned_agents("@Codex 修复；@CLAUDE CODE review，@claude 再看"), ["Codex", "Claude Code"])
         self.assertEqual(mentioned_agents("a@codex.example @codextra @claude-bot @@codex"), [])

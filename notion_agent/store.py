@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -69,6 +70,25 @@ class Store:
 
     def latest_primary(self, page_id):
         return next((r for r in reversed(self.history(page_id)) if r.get("primary", True)), None)
+
+    def timing_stats(self, page_id):
+        measurements = []
+        for run in self.history(page_id):
+            try:
+                start = datetime.fromisoformat(run["started_at"].replace("Z", "+00:00"))
+                end = datetime.fromisoformat(run["ended_at"].replace("Z", "+00:00"))
+                if start.tzinfo is None or end.tzinfo is None:
+                    continue
+                seconds = (end - start).total_seconds()
+            except (KeyError, TypeError, ValueError):
+                continue
+            if seconds >= 0:
+                measurements.append((end, seconds))
+        if not measurements:
+            return None
+        return {"latest_seconds": round(max(measurements, key=lambda m: m[0])[1], 3),
+                "total_seconds": round(math.fsum(m[1] for m in measurements), 3),
+                "execution_count": len(measurements)}
 
     def sent_comment_ids(self, page_id):
         operations = [op for run in self.history(page_id)

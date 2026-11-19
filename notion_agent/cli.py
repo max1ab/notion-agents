@@ -138,6 +138,9 @@ def run(args):
         try:
             notion = Notion(config.token(), config.data_source_id)
             notion.check_schema()
+            if config.execution_data_source_id:
+                notion.check_execution_schema(config.execution_data_source_id)
+                print("Notion 执行记录 schema：通过")
             if config.projects_data_source_id:
                 config.projects = notion.projects(config.projects_data_source_id, config.machine_id,
                                                  by_id=notion.project_property_type == "relation")
@@ -163,6 +166,8 @@ def run(args):
         return
     with machine_lock(config):
         notion.check_schema()
+        if config.execution_data_source_id:
+            notion.check_execution_schema(config.execution_data_source_id)
         worker = Worker(config, notion, store)
         async def work():
             loop = asyncio.get_running_loop()

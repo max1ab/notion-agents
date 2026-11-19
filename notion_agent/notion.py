@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 import time
 import urllib.error
@@ -14,6 +15,13 @@ class NotionError(RuntimeError):
 
 class CommentWriteUncertain(NotionError):
     """An attempted comment cannot yet be reconciled; never append blindly."""
+
+
+class ExecutionWriteUncertain(NotionError):
+    """A record create may have succeeded; reconcile before attempting another."""
+
+
+TIMING_PROPERTIES = {"最近耗时（秒）": "latest_seconds", "累计耗时（秒）": "total_seconds", "执行次数": "execution_count"}
 
 
 def rich(text):
@@ -90,6 +98,9 @@ class Notion:
         errors = [f"{key} 需要 {kind}" for key, kind in expected.items() if schema.get(key, {}).get("type") != kind]
         options = {x["name"] for x in schema.get("状态", {}).get("status", {}).get("options", [])}
         errors += [f"缺少状态：{name}" for name in ("草稿", "待办", "执行中", "待我验收", "完成", "需处理") if name not in options]
+        self.timing_enabled = all(schema.get(name, {}).get("type") == "number" for name in TIMING_PROPERTIES)
+        if any(name in schema for name in TIMING_PROPERTIES) and not self.timing_enabled:
+            errors.append("耗时统计需要最近耗时（秒）、累计耗时（秒）、执行次数三个 number 字段")
         if errors:
             raise ValueError("；".join(errors))
         return schema
@@ -162,6 +173,73 @@ class Notion:
 
     def page(self, page_id):
         return self.request("GET", "pages/" + page_id)
+
+    def update_timings(self, page_id, stats):
+        if getattr(self, "timing_enabled", False) and stats:
+            self.request("PATCH", "pages/" + page_id, {"properties": {
+                name: {"number": stats[key]} for name, key in TIMING_PROPERTIES.items()}})
+
+    def check_execution_schema(self, source_id):
+        schema = self.request("GET", "data_sources/" + source_id)["properties"]
+        expected = {"执行": "title", "任务": "relation", "Agent": "select", "执行时间": "date",
+                    "耗时（秒）": "number", "结果": "select", "触发方式": "select",
+                    "机器": "rich_text", "运行 ID": "rich_text",
+                    "开始时间（原始）": "rich_text", "结束时间（原始）": "rich_text"}
+        errors = [name for name, kind in expected.items() if schema.get(name, {}).get("type") != kind]
+        if schema.get("任务", {}).get("relation", {}).get("data_source_id") != self.source:
+            errors.append("任务关联目标")
+        options = {o["name"] for o in schema.get("结果", {}).get("select", {}).get("options", [])}
+        if not {"执行中", "待我验收", "需处理"}.issubset(options):
+            errors.append("结果选项")
+        if errors:
+            raise ValueError("执行记录表字段不匹配：" + ", ".join(errors))
+        self._execution_source_checked = source_id
+
+    def sync_execution(self, source_id, run, persist):
+        if getattr(self, "_execution_source_checked", None) != source_id:
+            self.check_execution_schema(source_id)
+        operation = run.setdefault("execution_record", {"source_id": source_id})
+        if operation["source_id"] != source_id:
+            raise ExecutionWriteUncertain("执行记录的数据源发生变化，请核对本地运行记录")
+        dates = {"start": run["started_at"]}
+        seconds = None
+        if run.get("ended_at"):
+            dates["end"] = run["ended_at"]
+            seconds = max(0, round((datetime.fromisoformat(run["ended_at"].replace("Z", "+00:00"))
+                                   - datetime.fromisoformat(run["started_at"].replace("Z", "+00:00"))).total_seconds(), 3))
+        properties = {"执行": {"title": rich(run["snapshot"]["title"] + " · " + run["agent"])},
+                      "任务": {"relation": [{"id": run["page_id"]}]},
+                      "Agent": {"select": {"name": run["agent"]}}, "执行时间": {"date": dates},
+                      "开始时间（原始）": {"rich_text": rich(run["started_at"])},
+                      "结束时间（原始）": {"rich_text": rich(run.get("ended_at", ""))},
+                      "耗时（秒）": {"number": seconds},
+                      "结果": {"select": {"name": run.get("target_status", "执行中")}},
+                      "触发方式": {"select": {"name": "评论续聊" if run.get("trigger") else "任务派单"}},
+                      "机器": {"rich_text": rich(run["machine"])}, "运行 ID": {"rich_text": rich(run["id"])}}
+        if not operation.get("page_id"):
+            result = self.request("POST", "data_sources/" + source_id + "/query",
+                                  {"filter": {"property": "运行 ID", "rich_text": {"equals": run["id"]}}, "page_size": 2})
+            matches = result["results"]
+            if len(matches) > 1 or result.get("has_more"):
+                raise ExecutionWriteUncertain("同一运行 ID 对应多条执行记录，请人工核对")
+            if matches:
+                links = matches[0].get("properties", {}).get("任务", {}).get("relation", [])
+                if len(links) != 1 or links[0]["id"].replace("-", "") != run["page_id"].replace("-", ""):
+                    raise ExecutionWriteUncertain("执行记录关联了其他任务，请人工核对")
+                operation["page_id"] = matches[0]["id"]
+                persist()
+            elif operation.get("attempted"):
+                raise ExecutionWriteUncertain("执行记录创建结果未确认，可能已删除或尚不可见；暂不重复创建")
+            else:
+                operation["attempted"] = True
+                persist()
+                result = self.request("POST", "pages", {"parent": {"type": "data_source_id", "data_source_id": source_id},
+                                                        "properties": properties})
+                operation["page_id"] = result["id"]
+                persist()
+                return result["id"]
+        self.request("PATCH", "pages/" + operation["page_id"], {"properties": properties})
+        return operation["page_id"]
 
     def list_comments(self, page_id):
         comments = []
