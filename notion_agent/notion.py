@@ -46,6 +46,14 @@ def value(page, name):
     return p.get(kind, "") if kind else ""
 
 
+def assignee_property(properties):
+    return "执行 Agent" if "执行人" not in properties and "执行 Agent" in properties else "执行人"
+
+
+def assignee(page):
+    return value(page, assignee_property(page.get("properties", {})))
+
+
 def project_key(page):
     prop = page.get("properties", {}).get("项目", {})
     if prop.get("type") == "relation":
@@ -109,7 +117,7 @@ class Notion:
         if self.project_property_type not in ("select", "relation"):
             raise ValueError("项目字段必须为关联或旧版 select")
         self.project_relation_target = schema.get("项目", {}).get("relation", {}).get("data_source_id")
-        expected = {"任务": "title", "状态": "status", "执行 Agent": "select",
+        expected = {"任务": "title", "状态": "status", assignee_property(schema): "select",
                     "类型": "select", "优先级": "select", "最近运行 ID": "rich_text", "运行摘要": "rich_text"}
         if self.project_property_type == "select":
             expected["执行机器"] = "select"

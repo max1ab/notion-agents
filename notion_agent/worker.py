@@ -13,7 +13,7 @@ from pathlib import Path
 
 from . import workspace
 from .config import AGENT_NAMES, load
-from .notion import value, project_key, text_of, NotionError
+from .notion import assignee, assignee_property, value, project_key, text_of, NotionError
 from .runners import execute, process_alive, parse_events
 
 log = logging.getLogger(__name__)
@@ -36,7 +36,7 @@ def task_snapshot(page, body):
     return {**({"parent": page["direct_parent"]} if "direct_parent" in page else {}),
             "title": value(page, "任务"), "body": body,
             "machine": "" if page.get("properties", {}).get("项目", {}).get("type") == "relation" else value(page, "执行机器"),
-            "delegation_allowed": delegation_allowed(page), "agent": value(page, "执行 Agent"), "project": project_key(page),
+            "delegation_allowed": delegation_allowed(page), "agent": assignee(page), "project": project_key(page),
             "project_type": page.get("properties", {}).get("项目", {}).get("type"), "kind": value(page, "类型"),
             "edited": page.get("last_edited_time"), "previous_run_id": value(page, "最近运行 ID")}
 
@@ -174,10 +174,13 @@ class Worker:
                 page = {**page, "properties": dict(page["properties"]), "direct_parent": {
                     "id": parent_id, "url": current.get("url") or "https://www.notion.so/" + normalized,
                     "title": value(current, "任务"), "edited": current.get("last_edited_time")}}
-            for key in ("项目", "执行 Agent", "类型"):
-                if not value(page, key) and not page["properties"].get(key, {}).get("has_more"):
-                    page["properties"][key] = current["properties"].get(key, {})
-            if all(value(page, key) for key in ("项目", "执行 Agent", "类型")):
+            child_props = page["properties"]
+            parent_props = current["properties"]
+            inherited = (("项目", "项目"), (assignee_property(child_props), assignee_property(parent_props)), ("类型", "类型"))
+            for child_key, parent_key in inherited:
+                if not value(page, child_key) and not child_props.get(child_key, {}).get("has_more"):
+                    child_props[child_key] = parent_props.get(parent_key, {})
+            if all(value(page, child_key) for child_key, _ in inherited):
                 break
         return page
 
@@ -212,7 +215,7 @@ class Worker:
         relation = page.get("properties", {}).get("项目", {}).get("type") == "relation"
         if (not trigger_agent and value(page, "状态") != "待办") or (not relation and value(page, "执行机器") != c.machine_id):
             return "不属于本机待办"
-        agent = trigger_agent or value(page, "执行 Agent")
+        agent = trigger_agent or assignee(page)
         if not trigger_agent and agent not in AGENT_NAMES:
             return MANUAL
         if agent not in c.agents or not c.agents[agent].get("enabled", True):
@@ -261,7 +264,7 @@ class Worker:
         page = self.effective_page(page)
         route_agent = run.get("route_agent", run["agent"])
         if run["snapshot"].get("project_type") == "relation":
-            if project_key(page) != run["snapshot"]["project"] or value(page, "执行 Agent") != route_agent:
+            if project_key(page) != run["snapshot"]["project"] or assignee(page) != route_agent:
                 return False
             project = self.notion.page(run["snapshot"]["project"])
             if project.get("archived") or project.get("in_trash"):
@@ -271,7 +274,7 @@ class Worker:
                 return False
             return (value(project, "执行机器") == run["machine"]
                     and Path(directory).expanduser().resolve() == Path(run.get("workspace") or run["project_settings"]["path"]).resolve())
-        return (value(page, "执行机器") == run["machine"] and value(page, "执行 Agent") == route_agent
+        return (value(page, "执行机器") == run["machine"] and assignee(page) == route_agent
                 and value(page, "项目") == run["snapshot"]["project"])
 
     def seal(self, run, error=None):

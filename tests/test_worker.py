@@ -1002,6 +1002,22 @@ else:
         await worker.scan()
         self.assertEqual([r["agent"] for r in self.store.all()], ["Codex"])
 
+    async def test_renamed_assignee_supports_inheritance_none_and_delivery(self):
+        child, parent, root, _ = self.subitem_tree()
+        for card in (child, parent, root):
+            props = card["properties"]
+            props["执行人"] = props.pop("执行 Agent")
+        child["properties"]["执行人"]["select"] = {"name": "None"}
+        worker = self.worker()
+        await worker.scan()
+        self.assertFalse(self.store.all())
+        self.assertEqual(value(child, "状态"), "待办")
+
+        child["properties"]["执行人"]["select"] = None
+        await worker.scan()
+        self.assertEqual([r["agent"] for r in self.store.all()], ["Claude Code"])
+        self.assertEqual(value(child, "状态"), "待我验收")
+
     async def test_subitem_inherits_and_resumes_with_only_fresh_direct_parent_context(self):
         child, parent, root, bodies = self.subitem_tree()
         worker = self.worker()
@@ -1608,6 +1624,19 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(notion.parent_property, "归属任务")
         notion.configured_parent_property = "不存在"
         with self.assertRaisesRegex(ValueError, "parent_property"):
+            notion.check_schema()
+
+    def test_schema_accepts_either_assignee_name(self):
+        schema = page()["properties"]
+        schema["状态"]["status"]["options"] = [{"name": name} for name in
+                                            ("草稿", "待办", "执行中", "待我验收", "完成", "需处理")]
+        notion = Notion("fake", "tasks")
+        notion.source_schema = lambda: {"properties": schema}
+        notion.check_schema()
+        schema["执行人"] = schema.pop("执行 Agent")
+        notion.check_schema()
+        schema["执行人"]["type"] = "rich_text"
+        with self.assertRaisesRegex(ValueError, "执行人 需要 select"):
             notion.check_schema()
 
     def test_subitem_query_finds_blank_project_children_for_dispatch_and_comments(self):
