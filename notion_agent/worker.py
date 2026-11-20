@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import workspace
-from .config import load
+from .config import AGENT_NAMES, load
 from .notion import value, project_key, text_of, NotionError
 from .runners import execute, process_alive, parse_events
 
@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 
 # A sealed run waiting for reconciliation blocks only its own issue, silently.
 WAITING = "存在未结束的本地运行，等待对账"
+MANUAL = "未指定自动执行的 Agent"
 
 
 def now():
@@ -212,6 +213,8 @@ class Worker:
         if (not trigger_agent and value(page, "状态") != "待办") or (not relation and value(page, "执行机器") != c.machine_id):
             return "不属于本机待办"
         agent = trigger_agent or value(page, "执行 Agent")
+        if not trigger_agent and agent not in AGENT_NAMES:
+            return MANUAL
         if agent not in c.agents or not c.agents[agent].get("enabled", True):
             return "Agent 未启用"
         if not os.access(c.agents[agent]["command"], os.X_OK):
@@ -499,8 +502,8 @@ class Worker:
             else:
                 self.reject(page, reason)
         reason = self.candidate(page, agent)
-        if reason == WAITING:
-            return  # Never overwrite a status that is still awaiting reconciliation.
+        if reason in (WAITING, MANUAL):
+            return
         if reason:
             decline(reason)
             return
@@ -684,6 +687,8 @@ class Worker:
                 continue
             if reason == WAITING:
                 log.info("任务 %s 等待本地运行对账，本轮跳过", page["id"])
+                continue
+            if reason == MANUAL:
                 continue
             claimed = len(self.store.history(page["id"]))
             try:

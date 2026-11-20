@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+AGENT_NAMES = ("Codex", "Claude Code")
+
+
 def read_env(path: Path) -> dict[str, str]:
     """Read single-line dotenv assignments without executing or exporting them."""
     if not path.exists():
@@ -83,7 +86,7 @@ def load(path: Path) -> Config:
         raise ValueError("machine_id 不能为空")
     agents = data.get("agents", {})
     for name, agent in agents.items():
-        if name not in ("Codex", "Claude Code"):
+        if name not in AGENT_NAMES:
             raise ValueError(f"未知 Agent：{name}")
         binary = agent.get("command", "")
         if not Path(binary).is_absolute():

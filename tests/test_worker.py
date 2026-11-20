@@ -908,6 +908,21 @@ else:
         self.assertEqual(self.calls, 1)
         self.assertEqual(self.store.all()[0]["agent"], "Codex")
 
+    async def test_only_named_agents_are_automatically_dispatched(self):
+        selection = self.notion.p["properties"]["执行 Agent"]
+        worker = self.worker()
+        for executor in (None, {"name": "我"}, {"name": "其他执行人"}):
+            selection["select"] = executor
+            await worker.scan()
+        self.assertFalse(self.notion.writes)
+        self.assertFalse(self.store.all())
+        self.assertEqual(value(self.notion.p, "状态"), "待办")
+
+        self.add_card("page-2", "demo")
+        await worker.scan()
+        self.assertEqual([r["page_id"] for r in self.store.all()], ["page-2"])
+        self.assertEqual(value(self.notion.p, "状态"), "待办")
+
     async def test_failed_resume_can_retry_original_session(self):
         await self.worker().scan()
         self.incoming("@codex 继续")
@@ -974,6 +989,18 @@ else:
         bodies = {"root": "祖卡独有正文", "parent": "直接父卡正文", child["id"]: "当前任务", "project-1": "项目指令"}
         self.notion.body = lambda key: bodies[key]
         return child, parent, root, bodies
+
+    async def test_manual_assignee_overrides_parent_without_blocking_explicit_mention(self):
+        child, _, _, _ = self.subitem_tree()
+        child["properties"]["执行 Agent"]["select"] = {"name": "我"}
+        worker = self.worker()
+        await worker.scan()
+        self.assertFalse(self.store.all())
+        self.assertEqual(value(child, "状态"), "待办")
+
+        self.incoming("@codex 帮我查一下")
+        await worker.scan()
+        self.assertEqual([r["agent"] for r in self.store.all()], ["Codex"])
 
     async def test_subitem_inherits_and_resumes_with_only_fresh_direct_parent_context(self):
         child, parent, root, bodies = self.subitem_tree()
