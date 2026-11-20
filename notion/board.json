@@ -1,0 +1,67 @@
+{
+  "任务看板": {
+    "properties": {
+      "任务": {
+        "type": "title"
+      },
+      "状态": {
+        "type": "status",
+        "options": [
+          "草稿",
+          "待办",
+          "执行中",
+          "待我验收",
+          "完成",
+          "需处理"
+        ],
+        "default": "草稿"
+      },
+      "项目": {
+        "type": "relation",
+        "target": "Agent 项目配置"
+      },
+      "执行人": {
+        "type": "select",
+        "options": [
+          "Codex",
+          "Claude Code",
+          "None"
+        ]
+      },
+      "类型": {
+        "type": "select",
+        "options": [
+          "代码",
+          "调研"
+        ]
+      },
+      "优先级": {
+        "type": "select",
+        "options": [
+          "高",
+          "中",
+          "低"
+        ]
+      },
+      "最近运行 ID": {
+        "type": "rich_text"
+      },
+      "运行摘要": {
+        "type": "rich_text"
+      }
+    }
+  },
+  "Agent 项目配置": {
+    "properties": {
+      "项目": {
+        "type": "title"
+      },
+      "执行机器": {
+        "type": "rich_text"
+      },
+      "本机目录": {
+        "type": "rich_text"
+      }
+    }
+  }
+}
