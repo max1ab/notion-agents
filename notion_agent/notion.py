@@ -57,8 +57,10 @@ def project_key(page):
 
 
 class Notion:
-    def __init__(self, token, data_source_id):
+    def __init__(self, token, data_source_id, parent_property=None):
         self.token = token
+        self.configured_parent_property = parent_property
+        self.parent_property = None
         self.source = data_source_id
         self.last_request = 0.0
 
@@ -95,6 +97,14 @@ class Notion:
 
     def check_schema(self):
         schema = self.source_schema()["properties"]
+        # Sub-items expose a self-relation. Its reverse lists children and must never be followed.
+        names = (self.configured_parent_property,) if self.configured_parent_property else (
+            "Parent item", "Parent Item", "父项目", "父级项目", "父项", "父任务", "上级项目")
+        parents = [name for name in names if name in schema and schema[name].get("type") == "relation"
+                   and (schema[name]["relation"].get("data_source_id") or "").replace("-", "") == self.source.replace("-", "")]
+        if len(parents) > 1 or (self.configured_parent_property and not parents):
+            raise ValueError("请用 parent_property 指定任务表指向本表的父项字段名")
+        self.parent_property = next(iter(parents), None)
         self.project_property_type = schema.get("项目", {}).get("type")
         if self.project_property_type not in ("select", "relation"):
             raise ValueError("项目字段必须为关联或旧版 select")
@@ -132,10 +142,16 @@ class Notion:
         if project_ids is not None and not project_ids:
             return []
         groups = [None] if project_ids is None else [project_ids[i:i + 90] for i in range(0, len(project_ids), 90)]
-        rows = []
+        routes = []
         for group in groups:
             routing = ({"property": "执行机器", "select": {"equals": machine_id}} if group is None else
                        {"or": [{"property": "项目", "relation": {"contains": id}} for id in group]})
+            routes.append(routing)
+        if project_ids is not None and self.parent_property:
+            routes.append({"and": [{"property": "项目", "relation": {"is_empty": True}},
+                                  {"property": self.parent_property, "relation": {"is_not_empty": True}}]})
+        rows = []
+        for routing in routes:
             filters = [routing]
             if status is not None:
                 filters.insert(0, {"property": "状态", "status": {"equals": status}})
@@ -222,7 +238,8 @@ class Notion:
                       "结束时间（原始）": {"rich_text": rich(run.get("ended_at", ""))},
                       "耗时（秒）": {"number": seconds},
                       "结果": {"select": {"name": run.get("target_status", "执行中")}},
-                      "触发方式": {"select": {"name": "评论续聊" if run.get("trigger") else "任务派单"}},
+                      "触发方式": {"select": {"name": ("自动" + run["automatic"]["kind"] if run.get("automatic") else
+                                                   "评论续聊" if run.get("trigger") else "任务派单")}},
                       "机器": {"rich_text": rich(run["machine"])}, "运行 ID": {"rich_text": rich(run["id"])}}
         if not operation.get("page_id"):
             result = self.request("POST", "data_sources/" + source_id + "/query",

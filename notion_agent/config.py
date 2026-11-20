@@ -54,6 +54,7 @@ class Config:
     agent_guide_page_id: str | None = None
     execution_data_source_id: str | None = None
     max_parallel_projects: int = 2
+    parent_property: str | None = None
 
     def token(self):
         value = os.environ.get(self.token_env, "")
@@ -105,7 +106,7 @@ def load(path: Path) -> Config:
                   projects_data_source_id=data.get("projects_data_source_id") or None,
                   agent_guide_page_id=data.get("agent_guide_page_id") or None,
                   execution_data_source_id=data.get("execution_data_source_id") or None,
-                  max_parallel_projects=parallel)
+                  max_parallel_projects=parallel, parent_property=data.get("parent_property") or None)
 
 
 def save(data: dict, path: Path):

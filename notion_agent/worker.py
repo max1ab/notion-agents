@@ -26,10 +26,16 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def delegation_allowed(page):
+    prop = page.get("properties", {}).get("允许 Agent 转派", {})
+    return prop.get("type") == "checkbox" and prop.get("checkbox") is True
+
+
 def task_snapshot(page, body):
-    return {"title": value(page, "任务"), "body": body,
+    return {**({"parent": page["direct_parent"]} if "direct_parent" in page else {}),
+            "title": value(page, "任务"), "body": body,
             "machine": "" if page.get("properties", {}).get("项目", {}).get("type") == "relation" else value(page, "执行机器"),
-            "agent": value(page, "执行 Agent"), "project": project_key(page),
+            "delegation_allowed": delegation_allowed(page), "agent": value(page, "执行 Agent"), "project": project_key(page),
             "project_type": page.get("properties", {}).get("项目", {}).get("type"), "kind": value(page, "类型"),
             "edited": page.get("last_edited_time"), "previous_run_id": value(page, "最近运行 ID")}
 
@@ -61,7 +67,17 @@ Notion issue：https://www.notion.so/{run['page_id'].replace('-', '')}
 --- 用户的任务正文 ---
 {task['body']}
 """
-    if run.get("trigger"):
+    if parent := task.get("parent"):
+        prompt += (f"\n--- 直接父卡（供理解本卡任务）---\n{parent['title']}\n"
+                   f"{parent['url']}\n{parent['body']}\n")
+    if task.get("delegation_allowed"):
+        prompt += "\n本卡已勾选「允许 Agent 转派」。\n"
+    if run.get("automatic"):
+        action = run["automatic"]
+        prompt += ("\n--- 本轮自动" + action["kind"] + " ---\n"
+                   + action["sender"] + " 的交办或回传如下。以本轮要求为准。\n"
+                   + text_of(run["trigger"]["rich_text"]) + "\n")
+    elif run.get("trigger"):
         prompt += ("\n--- 评论续办 ---\n"
                    + ("你是本 issue 的主 Agent，服务根据你的结果更新状态。\n" if run["primary"] else
                       "你是附属 Agent，只完成本次评论要求并回复；服务不会用你的结果修改 issue 状态。\n")
@@ -106,6 +122,23 @@ def readable_answer(answer):
     return "\n".join(line for index, line in enumerate(lines) if index not in hidden).strip()
 
 
+def delegation_request(run, answer):
+    if not run["snapshot"].get("delegation_allowed") or not answer:
+        return []
+    line = answer.splitlines()[-1]
+    match = re.fullmatch(r"@(claude code|claude|codex)[ \t]+(\S.*)", line, re.I)
+    if not match:
+        return []
+    agent = "Codex" if match[1].lower() == "codex" else "Claude Code"
+    if agent == run["agent"]:
+        return []
+    action = {"kind": "派单", "agent": agent, "task": match[2]}
+    automatic = run.get("automatic", {})
+    if agent == automatic.get("sender"):
+        action.update(kind="续跑", origin=automatic["source"])
+    return [action]
+
+
 class Worker:
     def __init__(self, config, notion, store, runner=execute):
         self.config = config
@@ -113,6 +146,43 @@ class Worker:
         self.store = store
         self.runner = runner
         self.jobs = {}
+
+    def effective_page(self, page):
+        """Overlay the three inheritable fields on a copy of the child."""
+        field = getattr(self.notion, "parent_property", None)
+        if not field:
+            return page
+        current = page
+        seen = {page["id"].replace("-", "")}
+        while True:
+            prop = current["properties"].get(field, {})
+            links = prop.get("relation", [])
+            if prop.get("has_more") or len(links) > 1:
+                raise ValueError("任务只能关联一张直接父卡")
+            if not links:
+                break
+            parent_id = links[0]["id"]
+            normalized = parent_id.replace("-", "")
+            if normalized in seen:
+                raise ValueError("任务父子关系存在循环")
+            seen.add(normalized)
+            current = self.notion.page(parent_id)
+            if current.get("archived") or current.get("in_trash"):
+                raise ValueError("父卡已归档或移入回收站")
+            if "direct_parent" not in page:
+                page = {**page, "properties": dict(page["properties"]), "direct_parent": {
+                    "id": parent_id, "url": current.get("url") or "https://www.notion.so/" + normalized,
+                    "title": value(current, "任务"), "edited": current.get("last_edited_time")}}
+            for key in ("项目", "执行 Agent", "类型"):
+                if not value(page, key) and not page["properties"].get(key, {}).get("has_more"):
+                    page["properties"][key] = current["properties"].get(key, {})
+            if all(value(page, key) for key in ("项目", "执行 Agent", "类型")):
+                break
+        return page
+
+    def foreign_child_project(self, page):
+        return ("direct_parent" in page and page["properties"]["项目"].get("type") == "relation"
+                and not any(link["id"] in self.config.projects for link in value(page, "项目")))
 
     def project_busy(self, page, directory=None):
         if not self.jobs:
@@ -185,6 +255,7 @@ class Worker:
                 self.notion.register(self.config.machine_id, list(self.config.projects))
 
     def route_matches(self, page, run):
+        page = self.effective_page(page)
         route_agent = run.get("route_agent", run["agent"])
         if run["snapshot"].get("project_type") == "relation":
             if project_key(page) != run["snapshot"]["project"] or value(page, "执行 Agent") != route_agent:
@@ -203,6 +274,10 @@ class Worker:
     def seal(self, run, error=None):
         if error:
             run["error"] = error
+        if (run.get("automatic") and run.get("resume_session_id") and run.get("protocol_success")
+                and run.get("session_id") != run["resume_session_id"]):
+            run["error"] = "CLI 未确认恢复指定的原会话"
+            run["session_id"] = None
         verdict = outcome(run.get("answer", ""))
         run["verdict"] = verdict
         run["target_status"] = ("待我验收" if run.get("exit_code") == 0 and run.get("protocol_success")
@@ -220,6 +295,14 @@ class Worker:
             answer = readable_answer(run.get("answer", "")) or "这次没能完成任务，需要你确认后再继续。"
             if run.get("error") and run.get("answer"):
                 answer = "这次执行中断了，以下是已保存的回复，尚需核对：\n\n" + answer
+            succeeded = run.get("exit_code") == 0 and run.get("protocol_success") and not run.get("error")
+            run["actions"] = delegation_request(run, answer) if succeeded else []
+            if automatic := run.get("automatic"):
+                label = "自动" + automatic["kind"]
+                answer = label + " · " + run["agent"] + "\n\n" + answer
+                if not succeeded:
+                    reason = run.get("error") or run.get("protocol_error") or f'CLI 未确认成功（退出码 {run.get("exit_code")}）'
+                    answer += f"\n\n{label}失败：{reason}。可手动 @ Agent 继续。"
             run["reply_chunks"] = [answer[i:i + 18000] for i in range(0, len(answer), 18000)]
         run.update(phase="delivering", sent_chunks=run.get("sent_chunks", {}))
         self.store.put(run, stats=self.execution_stats(run))
@@ -352,7 +435,7 @@ class Worker:
         operation = run.setdefault("comment_operations", {}).setdefault(key, {})
         return self.notion.post_comment(run["page_id"], message, operation,
                                        lambda: self.store.put(run), discussion_id,
-                                       display_name="调度程序" if key == "claim" else run["agent"])
+                                       display_name="调度程序" if key == "claim" or key.startswith("stop-") else run["agent"])
 
     def sync_execution(self, run):
         source = run.get("execution_data_source_id", self.config.execution_data_source_id)
@@ -388,7 +471,7 @@ class Worker:
         log.info("评论交付 %s -> %s", run["id"], run["target_status"])
 
     def reject(self, page, reason):
-        current = self.notion.page(page["id"])
+        current = self.effective_page(self.notion.page(page["id"]))
         if value(current, "状态") != "待办" or task_snapshot(current, "") != task_snapshot(page, ""):
             return
         project = current.get("properties", {}).get("项目", {})
@@ -399,13 +482,18 @@ class Worker:
             return
         self.notion.update(page["id"], status="草稿", summary="未接单：" + reason)
 
-    async def accept(self, page, trigger=None, agent=None, comments=(), *, background=False):
+    async def accept(self, page, trigger=None, agent=None, comments=(), *, background=False, automatic=None, source=None):
         # Re-read full input immediately before local claim, no shell interpolation.
         self.refresh_projects()
-        page = self.notion.page(page["id"])
+        raw_page = self.notion.page(page["id"])
+        page = self.effective_page(raw_page)
+        if self.foreign_child_project(page):
+            return
         if background and self.project_busy(page):
             return
         def decline(reason):
+            if automatic:
+                raise ValueError(reason)
             if trigger:
                 self.comment_problem(page, trigger, agent, reason)
             else:
@@ -418,6 +506,7 @@ class Worker:
             return
         try:
             body = self.notion.body(page["id"])
+            parent_body = self.notion.body(page["direct_parent"]["id"]) if "direct_parent" in page else None
         except ValueError as error:
             decline(str(error))
             return
@@ -428,7 +517,17 @@ class Worker:
         history = self.store.history(page["id"])
         owner = history[0]["agent"] if history else (agent or snapshot["agent"])
         primary = not trigger or agent == owner
+        if automatic:
+            if (not self.route_matches(raw_page, source) or
+                    Path(source["workspace"]).resolve() != Path(self.config.projects[snapshot["project"]]["path"]).expanduser().resolve()):
+                raise ValueError("项目路由或目录已变化")
+            if not snapshot["delegation_allowed"]:
+                raise ValueError("此卡已关闭转派")
         previous = next((r for r in reversed(history) if r["agent"] == agent), None) if trigger else None
+        if automatic and automatic["kind"] == "续跑":
+            previous = self.store.get(automatic["origin"])
+            if not previous or not previous.get("session_id") or previous["page_id"] != page["id"] or previous["agent"] != agent:
+                raise ValueError("发起方原会话缺失")
         if previous and (previous["snapshot"]["project"] != snapshot["project"]
                          or Path(previous.get("workspace") or previous["project_settings"]["path"]).resolve()
                          != Path(self.config.projects[snapshot["project"]]["path"]).expanduser().resolve()):
@@ -461,10 +560,12 @@ class Worker:
         if len((guide + project.get("instructions", "")).encode("utf-8")) > 64000:
             decline("使用说明与项目指令合计超过 64000 字节")
             return
-        check = self.notion.page(page["id"])
+        check = self.effective_page(self.notion.page(page["id"]))
         if fingerprint(task_snapshot(check, body)) != fingerprint(snapshot) or check.get("last_edited_time") != page.get("last_edited_time"):
             log.info("任务正在编辑，本轮跳过 %s", page["id"])
             return
+        if parent_body is not None:
+            snapshot["parent"] = {**snapshot["parent"], "body": parent_body}
         run_id = str(uuid.uuid4())
         run_dir = self.config.state_dir / "runs" / run_id
         try:
@@ -486,18 +587,30 @@ class Worker:
         if trigger:
             run.update(trigger=trigger, agent=agent, agent_settings=self.config.agents[agent],
                        route_agent=snapshot["agent"], discussion_id=trigger.get("discussion_id"),
-                       resume_session_id=previous_session,
-                       context="\n\n".join(f"{r['agent']}：{readable_answer(r.get('answer', ''))}" for r in history)[-48000:]
+                       resume_session_id=previous_session)
+        if trigger and not automatic:
+            run["context"] = ("\n\n".join(f"{r['agent']}：{readable_answer(r.get('answer', ''))}" for r in history)[-48000:]
                        + "\n\n可见评论：\n" + "\n".join(text_of(c.get("rich_text", [])) for c in comments)[-24000:])
+        if automatic:
+            run["automatic"] = automatic
         self.store.put(run)
         (run_dir / "snapshot.json").write_text(json.dumps(run, ensure_ascii=False, indent=2))
         # Ambiguous claim response leaves a durable claimed record; recovery will reconcile, not launch.
         if primary:
-            self.notion.update(page["id"], status="执行中", run_id=run_id,
-                               summary=f"{run['agent']} 正在处理这个任务。")
+            try:
+                self.notion.update(page["id"], status="执行中", run_id=run_id,
+                                   summary=f"{run['agent']} 正在处理这个任务。")
+            except NotionError:
+                # For an automatic claim, a matching remote receipt proves the write landed.
+                if not automatic or value(self.notion.page(page["id"]), "最近运行 ID") != run_id:
+                    raise
         check = self.notion.page(page["id"])
         if (primary and (value(check, "最近运行 ID") != run_id or value(check, "状态") != "执行中")) or not self.route_matches(check, run):
             self.seal(run, "启动前路由或状态变化，未启动 Agent")
+            self.try_deliver(run)
+            return
+        if automatic and not delegation_allowed(check):
+            self.seal(run, "启动前用户已关闭转派")
             self.try_deliver(run)
             return
         if background:
@@ -513,7 +626,7 @@ class Worker:
             # The start row is best effort; a failure stays queued and never delays the Agent.
             self.store.put(run, stats=self.execution_stats(run))
             self.flush_stats(run)
-            if config.comments:
+            if config.comments and not run.get("automatic"):
                 _, run["discussion_id"] = self.conversation_message(run, "claim", f"{run['agent']} 开始处理这个任务。", run.get("discussion_id"))
                 self.store.put(run)
             (run_dir / "project-instructions.txt").write_text(run["project_settings"].get("instructions", ""))
@@ -548,12 +661,15 @@ class Worker:
             rows = self.notion.query(self.config.machine_id)
         result = []
         for page in rows:
-            if background and self.project_busy(page):
-                continue
             try:
+                page = self.effective_page(page)
+                if self.foreign_child_project(page) or (background and self.project_busy(page)):
+                    continue
                 reason = self.candidate(page)
                 if not reason:
                     try:
+                        if dry_run and "direct_parent" in page:
+                            self.notion.body(page["direct_parent"]["id"])
                         if not self.notion.body(page["id"]).strip():
                             reason = "任务正文不能为空"
                     except ValueError as error:
@@ -591,10 +707,13 @@ class Worker:
             rows = self.notion.query(self.config.machine_id, status=None)
         since = datetime.fromisoformat(self.store.comments_since)
         for page in rows:
-            if page.get("archived") or page.get("in_trash") or (background and self.project_busy(page)):
+            if page.get("archived") or page.get("in_trash"):
                 continue
             claimed = len(self.store.history(page["id"]))
             try:
+                page = self.effective_page(page)
+                if self.foreign_child_project(page) or (background and self.project_busy(page)):
+                    continue
                 if await self.scan_page_comments(page, since, background):
                     return True
             except Exception as error:
@@ -630,6 +749,44 @@ class Worker:
                     self.comment_problem(page, comment, agent, str(error))
                 if self.store.triggered(page["id"], comment["id"], agent):
                     return True
+        return await self.scan_actions(page, background)
+
+    async def scan_actions(self, page, background):
+        history = self.store.history(page["id"])
+        if any(r["phase"] != "complete" for r in history):
+            return False
+        for source in history:
+            if source.get("resolution"):
+                continue
+            for action in source.get("actions", []):
+                kind, agent = action["kind"], action["agent"]
+                key = f'auto:{source["id"]}:{kind}'
+                if self.store.triggered(page["id"], key, agent):
+                    continue
+                if "stopped" not in action:
+                    trigger = {"id": key, "discussion_id": source.get("discussion_id")}
+                    automatic = {"kind": kind, "sender": source["agent"], "source": source["id"]}
+                    if kind == "续跑":
+                        automatic["origin"] = action["origin"]
+                    task = ("发起方本轮回复：" + readable_answer(source["answer"])[-48000:]
+                            + "\n本次交办：" + action["task"])
+                    if source.get("automatic"):
+                        task = "上一轮交办：" + source["automatic"]["task"] + "\n" + task
+                    automatic["task"] = action["task"]
+                    trigger["rich_text"] = [{"plain_text": task}]
+                    try:
+                        await self.accept(page, trigger, agent, background=background, automatic=automatic, source=source)
+                    except ValueError as error:
+                        if self.store.triggered(page["id"], key, agent):
+                            raise
+                        action["stopped"] = str(error)
+                        self.store.put(source)
+                    else:
+                        return self.store.triggered(page["id"], key, agent)
+                notice = "stop-" + kind
+                if not source.get("comment_operations", {}).get(notice, {}).get("comment_id"):
+                    self.conversation_message(source, notice, f'自动{kind}停止：{action["stopped"]}。可手动 @ Agent 继续。',
+                                              source.get("discussion_id"))
         return False
 
     def comment_problem(self, page, comment, agent, reason):

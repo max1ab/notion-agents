@@ -79,7 +79,9 @@ class FakeNotion:
                 continue
             if project_ids is not None:
                 ids = [x["id"] for x in card.get("properties", {}).get("项目", {}).get("relation", [])]
-                if not set(ids).intersection(project_ids):
+                parent = getattr(self, "parent_property", None)
+                inherits = not ids and bool(value(card, parent))
+                if not set(ids).intersection(project_ids) and not inherits:
                     continue
             if status is None or value(card, "状态") == status:
                 rows.append(copy.deepcopy(card))
@@ -197,6 +199,158 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
 
     def worker(self):
         return Worker(self.config, self.notion, self.store, self.fake_runner)
+
+    def enable_handoff(self):
+        props = self.notion.p["properties"]
+        props["允许 Agent 转派"] = {"type": "checkbox", "checkbox": True}
+        self.config.agents["Claude Code"].update(command="/usr/bin/true", enabled=True)
+
+    async def delegate(self, config, run, store):
+        await self.fake_runner(config, run, store)
+        target = "@claude" if run["agent"] == "Codex" else "@codex"
+        run["answer"] = f"{target} 测试当前修改\n" + json.dumps(outcome(run["answer"]))
+
+    async def test_round_trip_cli_resume_and_lost_handoff_callback_replies(self):
+        self.notion = RemoteCommentNotion(page())
+        self.enable_handoff()
+        # Run the production command builder, child process and event parsers in both directions.
+        script = self.root / "cli"
+        script.write_text("""#!/usr/bin/env python3
+import sys, json
+prompt = sys.stdin.read()
+verdict = {"task_outcome":"ready_for_review","tests":"通过","limitations":""}
+def emit(obj):
+    print(json.dumps(obj))
+if sys.argv[1] == "exec":
+    if "resume" in sys.argv:
+        assert sys.argv[sys.argv.index("resume")+1] == "original-codex"
+        assert "审查发现" in prompt and "检查路由" in prompt
+        note = "已按审查意见处理"
+    else:
+        note = "代码已就绪\\n@claude 检查路由，完成后请叫我继续"
+    emit({"type":"thread.started","thread_id":"original-codex"})
+    emit({"type":"item.completed","item":{"type":"agent_message","text":note+"\\n"+json.dumps(verdict)}})
+    emit({"type":"turn.completed"})
+else:
+    assert "代码已就绪" in prompt and "检查路由" in prompt
+    emit({"type":"result","subtype":"success","session_id":"claude-review","result":"审查发现\\n@codex 请按意见修正\\n"+json.dumps(verdict)})
+""")
+        script.chmod(0o700)
+        for agent in self.config.agents.values():
+            agent["command"] = str(script)
+        update = self.notion.update
+        def lose_callback_claim(page_id, **fields):
+            update(page_id, **fields)
+            if fields.get("run_id") and len(self.store.all()) == 3:
+                raise NotionError("callback claim written, response lost")
+        self.notion.update = lose_callback_claim
+        for i in range(3):
+            self.notion.reply_fault = "lost"
+            await Worker(self.config, self.notion, self.store).scan()
+            self.assertEqual(len(self.store.all()), i + 1)
+            self.assertEqual(self.store.all()[-1]["phase"], "delivering")
+            self.restart()
+        for _ in range(2):
+            await Worker(self.config, self.notion, self.store).scan()
+        runs = self.store.all()
+        self.assertEqual([r["agent"] for r in runs], ["Codex", "Claude Code", "Codex"])
+        self.assertEqual([r.get("automatic", {}).get("kind") for r in runs], [None, "派单", "续跑"])
+        self.assertTrue(all(r["phase"] == "complete" and r["target_status"] == "待我验收" for r in runs))
+        self.assertEqual(len({r["discussion_id"] for r in runs}), 1)
+        self.assertEqual(len(self.notion.remote), 4)  # Initial claim plus three replies.
+        self.assertEqual(value(self.notion.p, "最近运行 ID"), runs[-1]["id"])
+
+    async def test_claude_to_codex_return_result_only(self):
+        self.enable_handoff()
+        self.notion.p["properties"]["执行 Agent"]["select"]["name"] = "Claude Code"
+        async def research(config, run, store):
+            await self.fake_runner(config, run, store)
+            if run["agent"] == "Claude Code":
+                run["answer"] = "@codex 调研可选方案\n" + json.dumps(outcome(run["answer"]))
+            else:
+                self.assertIn("调研可选方案", prompt_for(run))
+        for _ in range(4):
+            await Worker(self.config, self.notion, self.store, research).scan()
+        self.assertEqual([r["agent"] for r in self.store.all()], ["Claude Code", "Codex"])
+        self.assertIn("自动派单 · Codex", "".join(self.notion.comments.values()))
+
+    async def test_unlimited_handoffs_allow_manual_dual_mentions_in_order(self):
+        self.enable_handoff()
+        worker = Worker(self.config, self.notion, self.store, self.delegate)
+        for _ in range(6):
+            await worker.scan()
+        self.assertEqual([r["agent"] for r in self.store.all()], ["Codex", "Claude Code"] * 3)
+        self.incoming("@claude @codex 手动验证")
+        await self.worker().scan()
+        self.restart()
+        await self.worker().scan()
+        self.assertEqual([r["agent"] for r in self.store.all()[6:]], ["Claude Code", "Codex"])
+        self.assertTrue(all("automatic" not in r for r in self.store.all()[6:]))
+
+    async def test_only_checked_checkbox_authorizes_dispatch(self):
+        for prop in [{}, {"type":"checkbox", "checkbox":False}, {"type":"number", "number":1}]:
+            self.notion.p["properties"]["允许 Agent 转派"] = prop
+            self.notion.update("page-1", status="待办")
+            await Worker(self.config, self.notion, self.store, self.delegate).scan()
+            await self.worker().scan()
+        self.assertEqual(self.calls, 3)
+        self.assertFalse(any(r.get("actions") for r in self.store.all()))
+
+    async def test_revocation_stops_pending_dispatch_even_after_restart(self):
+        self.enable_handoff()
+        await Worker(self.config, self.notion, self.store, self.delegate).scan()
+        self.notion.p["properties"]["允许 Agent 转派"]["checkbox"] = False
+        await self.worker().scan()
+        self.restart()
+        self.enable_handoff()
+        await self.worker().scan()
+        self.assertEqual(self.calls, 1)
+        self.assertIn("已关闭转派", "".join(self.notion.comments.values()))
+
+    async def test_unavailable_target_leaves_manual_takeover(self):
+        self.enable_handoff()
+        await Worker(self.config, self.notion, self.store, self.delegate).scan()
+        self.config.agents["Claude Code"]["enabled"] = False
+        await self.worker().scan()
+        self.assertIn("Agent 未启用", "".join(self.notion.comments.values()))
+        self.assertEqual(self.calls, 1)
+
+    async def test_failed_target_does_not_wake_sender(self):
+        self.enable_handoff()
+        async def fail_review(config, run, store):
+            await self.delegate(config, run, store)
+            if run["agent"] == "Claude Code":
+                run.update(exit_code=1, protocol_error="会话无法恢复")
+        worker = Worker(self.config, self.notion, self.store, fail_review)
+        for _ in range(4):
+            await worker.scan()
+        self.assertEqual(self.calls, 2)
+        self.assertIn("自动派单失败：会话无法恢复", "".join(self.notion.comments.values()))
+
+    async def test_callback_also_checks_checkbox(self):
+        self.enable_handoff()
+        worker = Worker(self.config, self.notion, self.store, self.delegate)
+        await worker.scan()
+        await worker.scan()
+        self.notion.p["properties"]["允许 Agent 转派"]["checkbox"] = False
+        await worker.scan()
+        self.assertEqual(self.calls, 2)
+        self.assertIn("自动续跑停止", "".join(self.notion.comments.values()))
+
+    async def test_only_final_addressed_request_dispatches(self):
+        self.enable_handoff()
+        verdict = {"task_outcome": "ready_for_review", "tests": "通过", "limitations": ""}
+        for note in ["文中引用 @claude 调研。", "> @claude 引用", "@claude 示例\n另外还有结论。",
+                     "```text\n@claude 示例\n```", "@codex 请自己继续", "@claude"]:
+            answer = note + "\n" + json.dumps(verdict)
+            async def report(config, run, store):
+                await self.fake_runner(config, run, store)
+                run["answer"] = answer
+            self.notion.update("page-1", status="待办")
+            await Worker(self.config, self.notion, self.store, report).scan()
+            await self.worker().scan()
+        self.assertEqual(self.calls, 6)
+        self.assertFalse(any(r["actions"] for r in self.store.all()))
 
     def stats_due(self):
         """Simulate the retry backoff elapsing."""
@@ -796,6 +950,102 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.notion.body = lambda id: "项目指令" if id == "project-1" else original_body(id)
         return remote
 
+    def subitem_tree(self):
+        self.relation_project()
+        self.notion.parent_property = "父项目"
+        child = self.notion.p
+        root = copy.deepcopy(child)
+        root["id"] = "root"
+        root["properties"]["状态"]["status"]["name"] = "完成"
+        root["properties"]["执行 Agent"]["select"]["name"] = "Claude Code"
+        root["properties"]["类型"]["select"]["name"] = "代码"
+        parent = copy.deepcopy(root)
+        parent["id"] = "parent"
+        parent["url"] = "https://www.notion.so/parent-link"
+        parent["properties"]["任务"]["title"] = rich("直接父卡标题")
+        parent["properties"]["允许 Agent 转派"] = {"type": "checkbox", "checkbox": True}
+        for card, ancestor in ((parent, root), (child, parent)):
+            card["properties"]["父项目"] = {"type": "relation", "relation": [{"id": ancestor["id"]}]}
+            card["properties"]["项目"]["relation"] = []
+            for key in ("执行 Agent", "类型"):
+                card["properties"][key]["select"] = None
+        self.config.agents["Claude Code"]["command"] = "/usr/bin/true"
+        self.notion.extra_pages.update(parent=parent, root=root)
+        bodies = {"root": "祖卡独有正文", "parent": "直接父卡正文", child["id"]: "当前任务", "project-1": "项目指令"}
+        self.notion.body = lambda key: bodies[key]
+        return child, parent, root, bodies
+
+    async def test_subitem_inherits_and_resumes_with_only_fresh_direct_parent_context(self):
+        child, parent, root, bodies = self.subitem_tree()
+        worker = self.worker()
+        with patch.object(self.notion, "body", wraps=self.notion.body) as body:
+            await worker.scan()
+            bodies["parent"] = "父卡修订正文"
+            self.incoming("@claude 请继续")
+            await worker.scan()
+        self.assertNotIn(("root",), [call.args for call in body.call_args_list])
+        runs = self.store.history(child["id"])
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(runs[1]["resume_session_id"], "actual-session")
+        for run, expected in zip(runs, ("直接父卡正文", "父卡修订正文")):
+            snap = run["snapshot"]
+            self.assertEqual((snap["agent"], snap["kind"], snap["project"]), ("Claude Code", "代码", "project-1"))
+            self.assertFalse(snap["delegation_allowed"])
+            directory = Path(run["run_dir"])
+            self.assertEqual(json.loads((directory / "snapshot.json").read_text())["snapshot"], snap)
+            prompt = (directory / "prompt.txt").read_text()
+            for field, actual in (("url", parent["url"]), ("body", expected), ("title", "直接父卡标题")):
+                self.assertEqual(snap["parent"][field], actual)
+                self.assertIn(actual, prompt)
+            self.assertNotIn("祖卡独有正文", prompt)
+        self.assertEqual(value(child, "状态"), "待我验收")
+        for ancestor in (root, parent):
+            self.assertEqual(value(ancestor, "状态"), "完成")
+            self.assertFalse(self.store.history(ancestor["id"]))
+        self.assertFalse(value(child, "项目"))
+
+    async def test_subitem_overrides_remote_project_agent_and_type(self):
+        child, parent, root, _ = self.subitem_tree()
+        root["properties"]["项目"]["relation"] = [{"id": "foreign-project"}]
+        self.incoming("@codex 开始")
+        await self.worker().scan()
+        self.assertFalse(self.notion.comments)
+        self.assertFalse(self.notion.writes)
+        child["properties"]["项目"]["relation"] = [{"id": "project-1"}]
+        child["properties"]["执行 Agent"]["select"] = {"name": "Codex"}
+        parent["properties"]["类型"]["select"] = {"name": "调研"}
+        await self.worker().scan()
+        snap = self.store.all()[0]["snapshot"]
+        self.assertEqual((snap["agent"], snap["kind"], snap["project"]), ("Codex", "调研", "project-1"))
+        child["properties"]["类型"]["select"] = {"name": "代码"}
+        self.incoming("@codex 再检查", "human-2")
+        await self.worker().scan()
+        self.assertEqual(self.store.all()[-1]["snapshot"]["kind"], "代码")
+
+    async def test_inherited_route_changed_before_delivery_holds_child_only(self):
+        child, parent, root, _ = self.subitem_tree()
+        async def move(config, run, store):
+            await self.fake_runner(config, run, store)
+            root["properties"]["项目"]["relation"] = [{"id": "foreign-project"}]
+        await Worker(self.config, self.notion, self.store, move).scan()
+        self.assertEqual(self.store.history(child["id"])[0]["phase"], "hold")
+        self.assertEqual(value(parent, "状态"), "完成")
+        self.assertEqual(value(root, "状态"), "完成")
+
+    async def test_subitem_parent_edit_during_claim_retries_without_starting(self):
+        child, parent, _, _ = self.subitem_tree()
+        original = self.notion.body
+        def edit_parent(key):
+            if key == "parent":
+                parent["last_edited_time"] = "v2"
+            return original(key)
+        self.notion.body = edit_parent
+        await self.worker().scan()
+        self.assertEqual(self.calls, 0)
+        self.assertEqual(value(child, "状态"), "待办")
+        await self.worker().scan()
+        self.assertEqual(self.calls, 1)
+
     async def test_relation_routes_from_project_without_task_machine(self):
         self.relation_project()
         await self.worker().scan()
@@ -1143,6 +1393,7 @@ class UnitTests(unittest.TestCase):
                   patch("notion_agent.cli.Store", return_value=store),
                   patch.dict(os.environ, {"NOTION_TOKEN": "fake"})):
                 notion = notion_cls.return_value
+                notion.parent_property = None
                 notion.check_execution_schema.side_effect = NotionError("Execution table is unavailable")
                 cli.run(cli.parser().parse_args(["--config", str(path), "run"]))
                 worker_cls.return_value.serve.assert_awaited_once()
@@ -1310,6 +1561,39 @@ class UnitTests(unittest.TestCase):
                 self.assertEqual(migrated.db.execute("PRAGMA quick_check").fetchone()[0], "ok")
             finally:
                 migrated.db.close()
+
+    def test_parent_property_discovery_checks_target_and_supports_renames(self):
+        schema = page()["properties"]
+        schema["状态"]["status"]["options"] = [{"name": name} for name in
+                                            ("草稿", "待办", "执行中", "待我验收", "完成", "需处理")]
+        schema["子项目"] = {"type": "relation", "relation": {"data_source_id": "tasks"}}
+        schema["父项目"] = {"type": "relation", "relation": {"data_source_id": "other"}}
+        notion = Notion("fake", "tasks")
+        notion.source_schema = lambda: {"properties": schema}
+        notion.check_schema()
+        self.assertIsNone(notion.parent_property)
+        schema["父项目"]["relation"]["data_source_id"] = "tasks"
+        notion.check_schema()
+        self.assertEqual(notion.parent_property, "父项目")
+        schema["归属任务"] = schema.pop("父项目")
+        notion.configured_parent_property = "归属任务"
+        notion.check_schema()
+        self.assertEqual(notion.parent_property, "归属任务")
+        notion.configured_parent_property = "不存在"
+        with self.assertRaisesRegex(ValueError, "parent_property"):
+            notion.check_schema()
+
+    def test_subitem_query_finds_blank_project_children_for_dispatch_and_comments(self):
+        notion = Notion("fake", "tasks")
+        notion.parent_property = "父项目"
+        for status in ("待办", None):
+            with patch.object(notion, "request", return_value={"results": [page()]}) as request:
+                self.assertEqual(len(notion.query("mac", ["local"], status)), 1)
+                filters = request.call_args.args[2]["filter"]["and"]
+                self.assertEqual(filters[-1], {"and": [
+                    {"property": "项目", "relation": {"is_empty": True}},
+                    {"property": "父项目", "relation": {"is_not_empty": True}}]})
+                self.assertEqual(len(filters), 2 if status else 1)
 
     def test_relation_query_filters_by_local_projects_and_deduplicates(self):
         notion = Notion("fake", "tasks")

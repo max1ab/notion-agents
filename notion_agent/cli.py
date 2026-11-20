@@ -139,8 +139,9 @@ def run(args):
             print(f"{name}：{'CLI 可用' if available else 'CLI 不存在'} ({settings['command']})")
             failed |= not available
         try:
-            notion = Notion(config.token(), config.data_source_id)
+            notion = Notion(config.token(), config.data_source_id, config.parent_property)
             notion.check_schema()
+            print("任务表父项字段：" + (notion.parent_property or "未识别，按独立任务处理"))
             if config.execution_data_source_id:
                 notion.check_execution_schema(config.execution_data_source_id)
                 print("Notion 执行记录 schema：通过")
@@ -156,7 +157,7 @@ def run(args):
         if failed:
             raise SystemExit(1)
         return
-    notion = Notion(config.token(), config.data_source_id)
+    notion = Notion(config.token(), config.data_source_id, config.parent_property)
     if args.action == "register":
         notion.check_schema()
         if notion.project_property_type == "relation":
