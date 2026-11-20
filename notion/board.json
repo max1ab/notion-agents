@@ -43,6 +43,10 @@
           "低"
         ]
       },
+      "禁用记忆": {
+        "type": "checkbox",
+        "default": false
+      },
       "最近运行 ID": {
         "type": "rich_text"
       },

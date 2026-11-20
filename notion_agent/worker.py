@@ -27,8 +27,8 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def delegation_allowed(page):
-    prop = page.get("properties", {}).get("允许 Agent 转派", {})
+def checked(page, name):
+    prop = page.get("properties", {}).get(name, {})
     return prop.get("type") == "checkbox" and prop.get("checkbox") is True
 
 
@@ -36,7 +36,8 @@ def task_snapshot(page, body):
     return {**({"parent": page["direct_parent"]} if "direct_parent" in page else {}),
             "title": value(page, "任务"), "body": body,
             "machine": "" if page.get("properties", {}).get("项目", {}).get("type") == "relation" else value(page, "执行机器"),
-            "delegation_allowed": delegation_allowed(page), "agent": assignee(page), "project": project_key(page),
+            "disable_memory": checked(page, "禁用记忆"),
+            "delegation_allowed": checked(page, "允许 Agent 转派"), "agent": assignee(page), "project": project_key(page),
             "project_type": page.get("properties", {}).get("项目", {}).get("type"), "kind": value(page, "类型"),
             "edited": page.get("last_edited_time"), "previous_run_id": value(page, "最近运行 ID")}
 
@@ -615,7 +616,7 @@ class Worker:
             self.seal(run, "启动前路由或状态变化，未启动 Agent")
             self.try_deliver(run)
             return
-        if automatic and not delegation_allowed(check):
+        if automatic and not checked(check, "允许 Agent 转派"):
             self.seal(run, "启动前用户已关闭转派")
             self.try_deliver(run)
             return

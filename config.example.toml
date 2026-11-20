@@ -20,6 +20,9 @@ comments = true
 command = "/opt/homebrew/bin/codex"
 args = ["--sandbox", "workspace-write"]
 
+# 只填本机独立配置的 Codex 记忆 MCP。Linux 示例为 ["hindsight", "openviking"]。
+memory_mcp_servers = []
+
 [agents."Claude Code"]
 command = "/opt/homebrew/bin/claude"
 args = ["--permission-mode", "dontAsk"]

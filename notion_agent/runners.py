@@ -33,7 +33,7 @@ def process_alive(run):
         return True
 
 
-def command(agent_name, settings, run_dir, session_id=None):
+def command(agent_name, settings, run_dir, session_id=None, *, disable_memory=False):
     args = list(settings.get("args", []))
     instructions_file = run_dir / "project-instructions.txt"
     instructions = instructions_file.read_text() if instructions_file.exists() else ""
@@ -42,11 +42,17 @@ def command(agent_name, settings, run_dir, session_id=None):
     if guide.strip():
         instructions = "工作空间使用说明：\n" + guide + "\n\n本项目指令：\n" + instructions
     if agent_name == "Codex":
+        if disable_memory:
+            args.extend(["--disable", "plugins", "--disable", "hooks", "--disable", "memories"])
+            for name in settings.get("memory_mcp_servers", []):
+                args.extend(["-c", f"mcp_servers.{name}.enabled=false"])
         if instructions.strip():
             args.extend(["-c", "developer_instructions=" + json.dumps(instructions, ensure_ascii=False)])
         # exec-level options (including --sandbox) precede the resume subcommand.
         resume = ["resume", session_id] if session_id else []
         return [settings["command"], "exec", *args, *resume, "--skip-git-repo-check", "--json", "-o", str(run_dir / "last-message.txt"), "-"]
+    if disable_memory:
+        args.append("--safe-mode")
     if instructions.strip():
         args.extend(["--append-system-prompt", instructions])
     resume = ["--resume", session_id] if session_id else []
@@ -103,7 +109,8 @@ def parse_events(path, agent):
 async def execute(config, run, store):
     run_dir = Path(run["run_dir"])
     prompt = (run_dir / "prompt.txt").read_text()
-    argv = command(run["agent"], run["agent_settings"], run_dir, run.get("resume_session_id"))
+    argv = command(run["agent"], run["agent_settings"], run_dir, run.get("resume_session_id"),
+                   disable_memory=run.get("snapshot", {}).get("disable_memory", False))
     with (run_dir / "events.jsonl").open("w") as stdout, (run_dir / "stderr.log").open("w") as stderr:
         # Persist the uncertainty window before process creation. Recovery never starts it twice.
         run["phase"] = "spawning"

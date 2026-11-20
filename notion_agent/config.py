@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -91,6 +92,11 @@ def load(path: Path) -> Config:
         binary = agent.get("command", "")
         if not Path(binary).is_absolute():
             raise ValueError(f"{name} command 必须是绝对路径")
+        if name == "Codex":
+            servers = agent.get("memory_mcp_servers", [])
+            if not isinstance(servers, list) or not all(
+                    isinstance(server, str) and re.fullmatch(r"[A-Za-z0-9_-]+", server) for server in servers):
+                raise ValueError("Codex memory_mcp_servers 必须为 MCP 服务名数组（字母、数字、下划线或连字符）")
     projects = data.get("projects", {})
     for project in projects.values():
         project["path"] = str(local(project["path"]))

@@ -121,6 +121,8 @@ class Notion:
                     "类型": "select", "优先级": "select", "最近运行 ID": "rich_text", "运行摘要": "rich_text"}
         if self.project_property_type == "select":
             expected["执行机器"] = "select"
+        if "禁用记忆" in schema:
+            expected["禁用记忆"] = "checkbox"
         errors = [f"{key} 需要 {kind}" for key, kind in expected.items() if schema.get(key, {}).get("type") != kind]
         options = {x["name"] for x in schema.get("状态", {}).get("status", {}).get("options", [])}
         errors += [f"缺少状态：{name}" for name in ("草稿", "待办", "执行中", "待我验收", "完成", "需处理") if name not in options]

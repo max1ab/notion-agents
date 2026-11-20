@@ -213,6 +213,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_round_trip_cli_resume_and_lost_handoff_callback_replies(self):
         self.notion = RemoteCommentNotion(page())
         self.enable_handoff()
+        self.notion.p["properties"]["禁用记忆"] = {"type": "checkbox", "checkbox": True}
         # Run the production command builder, child process and event parsers in both directions.
         script = self.root / "cli"
         script.write_text("""#!/usr/bin/env python3
@@ -222,6 +223,7 @@ verdict = {"task_outcome":"ready_for_review","tests":"通过","limitations":""}
 def emit(obj):
     print(json.dumps(obj))
 if sys.argv[1] == "exec":
+    assert [sys.argv[i+1] for i, arg in enumerate(sys.argv) if arg == "--disable"] == ["plugins", "hooks", "memories"]
     if "resume" in sys.argv:
         assert sys.argv[sys.argv.index("resume")+1] == "original-codex"
         assert "审查发现" in prompt and "检查路由" in prompt
@@ -232,6 +234,7 @@ if sys.argv[1] == "exec":
     emit({"type":"item.completed","item":{"type":"agent_message","text":note+"\\n"+json.dumps(verdict)}})
     emit({"type":"turn.completed"})
 else:
+    assert "--safe-mode" in sys.argv
     assert "代码已就绪" in prompt and "检查路由" in prompt
     emit({"type":"result","subtype":"success","session_id":"claude-review","result":"审查发现\\n@codex 请按意见修正\\n"+json.dumps(verdict)})
 """)
@@ -646,6 +649,19 @@ else:
         await self.worker().scan()
         self.assertEqual(self.calls, 2)
         self.assertEqual(value(self.notion.p, "最近运行 ID"), run["id"])
+
+    async def test_memory_checkbox_is_sampled_again_for_each_comment(self):
+        worker = self.worker()
+        await worker.scan()
+        self.assertFalse(self.store.all()[0]["snapshot"]["disable_memory"])
+        for checked in (True, False):
+            self.notion.p["properties"]["禁用记忆"] = {"type": "checkbox", "checkbox": checked}
+            self.incoming("@codex 请继续", id=f"toggle-{checked}")
+            await worker.scan()
+            run = self.store.all()[-1]
+            self.assertEqual(run["snapshot"]["disable_memory"], checked)
+            self.assertEqual(run["resume_session_id"], "actual-session")
+        self.assertEqual([r["snapshot"]["disable_memory"] for r in self.store.all()], [False, True, False])
 
     async def test_execution_record_start_finish_resume_and_lost_response(self):
         self.config.execution_data_source_id = "execution-source"
@@ -1571,6 +1587,25 @@ class UnitTests(unittest.TestCase):
             for argv in (codex, claude):
                 self.assertNotIn("--last", argv)
                 self.assertNotIn("--fork-session", argv)
+
+    def test_per_process_memory_flags_for_new_and_resumed_sessions(self):
+        codex_flags = ["--disable", "plugins", "--disable", "hooks", "--disable", "memories",
+                       "-c", "mcp_servers.hindsight.enabled=false", "-c", "mcp_servers.openviking.enabled=false"]
+        with tempfile.TemporaryDirectory() as directory:
+            for agent, flags in (("Codex", codex_flags), ("Claude Code", ["--safe-mode"])):
+                settings = {"command": "/cli", "args": ["--model", "example"]}
+                if agent == "Codex":
+                    settings["memory_mcp_servers"] = ["hindsight", "openviking"]
+                for session in (None, "original-session"):
+                    with self.subTest(agent=agent, session=session):
+                        root = Path(directory)
+                        normal = command(agent, settings, root, session)
+                        position = normal.index("example") + 1
+                        self.assertEqual(command(agent, settings, root, session, disable_memory=True),
+                                         normal[:position] + flags + normal[position:])
+                        self.assertEqual(settings["args"], ["--model", "example"])
+                        for flag in flags:
+                            self.assertNotIn(flag, normal)
 
     def test_comment_list_paginates_and_bot_lookup_is_cached(self):
         notion = Notion("fake", "source")

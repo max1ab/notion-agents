@@ -94,6 +94,20 @@ python3 -m notion_agent run
 
 最终回答须包含完整结果和最后一行验收 JSON（提示词由服务生成）。进程退出码 0、CLI 协议成功、明确声明满足验收条件，才进入「待我验收」；否则「需处理」。Claude 的 permission_denials 也会阻止交付成功。AI 的声明是交付依据，成果质量和验收仍由用户判断。
 
+## 按 Issue 禁用 Agent 记忆
+
+任务看板支持可选复选框 `禁用记忆`。旧看板缺少字段或卡片未勾选时，Agent 使用原启动参数。每次派单、评论续聊或转派都会读取本次卡片快照。勾选只作用于即将启动的进程；续聊沿用原会话，之前进入历史的内容仍然可见。
+
+- Codex 追加 `--disable plugins --disable hooks --disable memories`。独立注册的记忆 MCP 还要在各机 `config.toml` 的 `[agents.Codex]` 中列出。例如 Linux 上的 `memory_mcp_servers = ["hindsight", "openviking"]` 会分别追加 `-c mcp_servers.hindsight.enabled=false` 和 `-c mcp_servers.openviking.enabled=false`。只填写本机已配置的独立服务名，插件提供的 MCP 随插件关闭。名单留空时只关闭三个功能开关。
+- Claude Code 追加 `--safe-mode`。本机核对的 2.1.308 会同时关闭内建自动记忆、自定义插件、Hook、MCP、技能和 CLAUDE.md。内建终端仍遵循该机原有的工具权限。
+
+**Review 通过后上线**
+
+1. 等各执行机当前任务结束，部署已审阅代码。在各机服务账号下用 `codex --disable plugins mcp list` 核对独立记忆服务名，并填写本机配置。
+2. 在任务看板新建名为 `禁用记忆` 的 Checkbox 属性，模板默认留空。运行 `python3 -m notion_agent doctor` 检查看板和 CLI。
+3. 在空闲时重启服务。Linux 用 `systemctl --user restart notion-agent`，macOS 用 `launchctl kickstart -k gui/$(id -u)/top.mclab.notion-agent`。
+4. 用测试卡做一次未勾选派单，然后勾选并在评论 @ 原 Agent。检查同一会话的两次启动参数，让 Agent 通过终端运行 `ntn --version`。在 Linux 对照未勾选时的 Hindsight Hook 调用记录，确认勾选轮次无调用、两个记忆 MCP 均未启动。取消勾选后再续聊，确认恢复正常配置。
+
 ## 同卡 Agent 转派
 
 在任务卡勾选复选框 `允许 Agent 转派` 即可开启。可在 `agent_guide_page_id` 对应的工作区说明页里告诉 Codex 和 Claude Code 如何发起转派。Agent 在可见回复的最后单独写一行交办，验收 JSON 照常放在下一行。例如：
