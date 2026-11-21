@@ -650,6 +650,22 @@ else:
         self.assertEqual(self.calls, 2)
         self.assertEqual(value(self.notion.p, "最近运行 ID"), run["id"])
 
+    async def test_mention_includes_previous_comment_with_same_api_timestamp(self):
+        worker = self.worker()
+        await worker.scan()
+        previous = self.incoming("前一条评论里的任务正文", id="z-previous")
+        self.incoming("@codex", id="b-trigger", created=previous["created_time"])
+        self.incoming("触发之后发出的补充", id="a-later", created=previous["created_time"])
+        notion = Notion("fake", "source")
+        with patch.object(notion, "request", return_value={"results": self.notion.incoming_comments}), \
+                patch.object(self.notion, "list_comments", side_effect=notion.list_comments):
+            await worker.scan()
+        run = self.store.all()[-1]
+        self.assertEqual(run["resume_session_id"], "actual-session")
+        prompt = prompt_for(run)
+        self.assertIn("前一条评论里的任务正文", prompt)
+        self.assertNotIn("触发之后发出的补充", prompt)
+
     async def test_memory_checkbox_is_sampled_again_for_each_comment(self):
         worker = self.worker()
         await worker.scan()

@@ -292,7 +292,8 @@ class Notion:
             result = self.request("GET", path)
             comments.extend(result["results"])
             if not result.get("has_more"):
-                return sorted(comments, key=lambda c: (c.get("created_time", ""), c["id"]))
+                # Notion can give consecutive comments the same timestamp. Keep the API order for ties.
+                return sorted(comments, key=lambda c: c.get("created_time", ""))
             cursor = result["next_cursor"]
 
     def comment_author_is_bot(self, comment):
